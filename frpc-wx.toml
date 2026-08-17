@@ -1,0 +1,15 @@
+# wx_sender 部署机专用 frpc 配置（精简版，仅保留 wx 隧道）
+# serverAddr / auth.token 请与 coinMarker/frpc.toml 保持一致
+# ⚠️ 部署时把 YOUR_FRPS_TOKEN 替换为真实值后，本文件不要提交到任何公开仓库
+
+serverAddr = "91.98.134.93"
+serverPort = 17777
+auth.token = "YOUR_FRPS_TOKEN"
+
+# 个人微信发送服务（coinMarker SendWxMsg_huizai.go 默认调 127.0.0.1:15000）
+[[proxies]]
+name = "wx"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 15000
+remotePort = 15000

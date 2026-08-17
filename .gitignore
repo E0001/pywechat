@@ -1,3 +1,7 @@
-"__pycache__/" 
-"*.pyc" 
+"__pycache__/"
+"*.pyc"
 "*.venv"
+
+# wx_sender 运行产物（含消息内容，禁止入库）
+wx_sender.log*
+wx_sender_config.json
