@@ -1,6 +1,6 @@
 '''
 NVDA 激活微信 UIA 树流程:
-前提: NVDA 已运行(--no-speech 静音)
+前提: NVDA 已运行(--disable-speech 静音)
 1. 确认 NVDA 运行中
 2. 关闭微信
 3. 启动微信 → 把登录窗口带到前台(NVDA 注入 helper DLL)
@@ -45,7 +45,7 @@ def nvda_running():
 # 1. NVDA 必须在运行
 if not nvda_running():
     print('!! NVDA 未运行,先启动(静音)')
-    os.startfile(r'D:\VibeCoding\nvda\portable\nvda.exe --no-speech -m')
+    os.startfile(r'D:\VibeCoding\nvda\portable\nvda.exe --disable-speech -m')
     time.sleep(8)
     assert nvda_running(), 'NVDA 启动失败'
 print('[1/5] NVDA 运行中 OK')

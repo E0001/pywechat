@@ -52,7 +52,7 @@ python -m venv .venv
 
 ## 步骤 3：激活流程（每次重启微信前执行一次）
 
-1. 启动 NVDA（静默、无对话框）：`D:\VibeCoding\nvda\portable\nvda.exe --no-speech -m`
+1. 启动 NVDA（静默、无对话框）：`D:\VibeCoding\nvda\portable\nvda.exe --disable-speech -m`
    （退出用 `nvda.exe -q`）
 2. 关闭微信：`taskkill /F /IM Weixin.exe /T`（连同 `WeChatAppEx.exe`）
 3. 启动微信 → 出现登录窗口后**把窗口带到前台**（NVDA 只注入前台焦点窗口）

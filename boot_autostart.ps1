@@ -32,7 +32,7 @@ try {
 
 # 1) NVDA - UIA enabler, must precede WeChat
 if (-not (Get-Process -Name nvda -ErrorAction SilentlyContinue)) {
-    Start-Process 'C:\Users\kk\nvda\portable\nvda.exe' -ArgumentList '--no-speech','-m'
+    Start-Process 'C:\Users\kk\nvda\portable\nvda.exe' -ArgumentList '--disable-speech','-m'
     Log 'NVDA started, wait 10s before WeChat'
     Start-Sleep -Seconds 10
 } else {

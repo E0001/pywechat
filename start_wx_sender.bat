@@ -17,7 +17,7 @@ tasklist /FI "IMAGENAME eq nvda.exe" 2>nul | find /i "nvda.exe" >nul
 if errorlevel 1 (
     if exist "%NVDA_PATH%" (
         echo [1/2] 启动 NVDA(静默)...
-        start "" "%NVDA_PATH%" --no-speech -m
+        start "" "%NVDA_PATH%" --disable-speech -m
         timeout /t 3 /nobreak >nul
     ) else (
         echo [警告] NVDA 未运行且未找到 %NVDA_PATH%, 若微信是 NVDA 启动前打开的, 发送会失败
