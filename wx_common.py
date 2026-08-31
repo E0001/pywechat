@@ -209,3 +209,63 @@ def search_terms(wxid: str, alias: str, default: str) -> list:
             seen.add(t)
             out.append(t)
     return out
+
+
+def wait_wechat_ready(logger=None, timeout=900, settle=15):
+    '''纯 Win32 EnumWindows(不碰 COM/UIA)等待微信登录就绪: 出现标题为
+    「微信」且宽>=500 的可见顶层窗口(=主窗口; 登录窗宽仅~280, 小窗标题
+    是好友备注名, 均不会误判; 最小化的主窗口 rect 宽度仍>500)。
+
+    2026-09-01 根因: 微信进程启动、登录窗口→主窗口的 UIA 树初始化
+    期间, 若有 UIA 客户端进程发起连接(wx_listener 的 COM 重试循环等),
+    微信会拒绝加载完整 UIA 树(主窗空壳、小窗不可用), 之后只能停光
+    所有客户端再重启微信才能恢复。服务进程必须在微信主窗口出现并
+    稳定之后才能初始化自己的 COM/UIA 环境; 本闸门保证开机自启时序,
+    无论服务与微信谁先启动。注意微信 Win32 类名是 Qt51514QWindowIcon
+    (mmui::* 只是 UIA 层名字, FindWindowW 找不到)。'''
+    import ctypes
+    import time as _t
+    import psutil
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    u.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM), wintypes.LPARAM]
+    u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    u.IsWindowVisible.argtypes = [wintypes.HWND]
+    class _RECT(ctypes.Structure):
+        _fields_ = [('l', wintypes.LONG), ('t', wintypes.LONG),
+                    ('r', wintypes.LONG), ('b', wintypes.LONG)]
+    u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
+    log = logger.info if logger else (lambda m, *a: print(m % a if a else m))
+    t0 = _t.time()
+    logged = False
+    while _t.time() - t0 < timeout:
+        hit = []
+        def _cb(h, _):
+            pid = wintypes.DWORD()
+            u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+            try:
+                p = psutil.Process(pid.value)
+                if (p.name() or '').lower() != 'weixin.exe' or not u.IsWindowVisible(h):
+                    return True
+            except Exception:
+                return True
+            c = ctypes.create_unicode_buffer(64); u.GetClassNameW(h, c, 64)
+            if not c.value.startswith('Qt51514QWindow'):
+                return True
+            t = ctypes.create_unicode_buffer(64); u.GetWindowTextW(h, t, 64)
+            r = _RECT(); u.GetWindowRect(h, ctypes.byref(r))
+            if t.value == '微信' and (r.r - r.l) >= 500:
+                hit.append(h)
+            return True
+        u.EnumWindows(ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(_cb), 0)
+        if hit:
+            log('微信主窗口已出现, 稳定等待 %ds 后初始化 UIA', settle)
+            _t.sleep(settle)
+            return True
+        if not logged:
+            log('等待微信主窗口(纯 Win32 探测, 不碰 UIA)...')
+            logged = True
+        _t.sleep(5)
+    return False

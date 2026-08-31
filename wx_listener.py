@@ -51,7 +51,8 @@ from pyweixin.Uielements import Lists  # noqa: E402
 from pyweixin.WeChatTools import Main_window, SideBar  # noqa: E402  实例(非类)
 from wx_common import (acquire_instance_lock, is_recent_inbound,  # noqa: E402
                        is_recent_sent_echo, log_inbound, search_terms,
-                       set_chat_hwnd, set_contact_name)
+                       set_chat_hwnd, set_contact_name,
+                       wait_wechat_ready)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, 'wx_sender_config.json')
@@ -410,6 +411,12 @@ def _handle_new_item(robot_wxid: str, wxid: str, remark: str, item) -> None:
 
 def main() -> None:
     if not load_config():
+        sys.exit(1)
+
+    # UIA 客户端闸门(2026-09-01 根因): 微信树初始化期间本进程若发起
+    # COM 连接会毒死微信 UIA, 必须等主窗口出现并稳定后才碰 UIA。
+    if not wait_wechat_ready(logger, timeout=900, settle=15):
+        logger.error('15 分钟内未见微信主窗口, 退出(勿在微信未就绪时初始化 UIA)')
         sys.exit(1)
 
     # 防息屏(UIA 常驻依赖微信窗口树, 息屏/锁屏后不可靠)

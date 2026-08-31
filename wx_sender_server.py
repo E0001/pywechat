@@ -436,6 +436,14 @@ def main():
             _stream.reconfigure(encoding='utf-8')
 
     cfg = ensure_config()
+
+    # UIA 客户端闸门(2026-09-01 根因): 微信树初始化期间本进程若发起
+    # COM 连接会毒死微信 UIA(主窗空壳/小窗不可用, 停光客户端+重启微信
+    # 才能恢复), 必须等微信主窗口出现并稳定后才初始化 UIA。
+    if not wx_common.wait_wechat_ready(logger, timeout=900, settle=15):
+        logger.error('15 分钟内未见微信主窗口, 退出')
+        sys.exit(1)
+
     check_prerequisites()
 
     send_queue = queue.Queue(maxsize=cfg.get('queue_max', 200))

@@ -38,28 +38,60 @@ python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 ```
 
-## 步骤 2：安装 NVDA 便携版（激活 UIA 的必需组件）
+## 步骤 2：~~安装 NVDA~~（已废弃，2026-09-01 退役）
 
-微信 4.1.12 只在检测到读屏器时才暴露完整 UIA 树，NVDA DLL 注入方案已实测可行
-（NVDA 必须在微信启动**之前**运行）。
+**NVDA 与微信 UIA 树无关，不要再装/启动它。** 2026-08-17 部署时的"读屏器
+必需"结论是误诊：所有启动脚本从第一天起用的 `--no-speech` 参数在 NVDA
+2026.1.1 里不存在（正确写法 `--disable-speech`），带它启动只会弹错误框、
+core 永不初始化——**即 NVDA 14 天来从未自动启动成功过，链路照样天天正常**，
+与微信树死活无关。保留的教训：NVDA 错误参数弹的对话框曾干扰排查，装了
+反而添乱。`C:\Users\kk\nvda\` 目录留着不碍事，所有脚本中的 NVDA 步骤已删除。
 
-1. 下载 NVDA 2026.1.1（GitHub release，国内可走代理）：
-   `https://github.com/nvaccess/nvda/releases` → `nvda_2026.1.1.exe`
-2. 制作便携版到 `D:\VibeCoding\nvda\portable`（与 `start_wx_sender.bat` 中 `NVDA_PATH` 一致）：
-   ```bat
-   nvda_2026.1.1.exe --create-portable-copy --portable-path=D:\VibeCoding\nvda\portable --minimal
-   ```
+## ⚠️ 微信 UIA 树加载时序（2026-09-01 定案的真根因，最重要的一节）
 
-## 步骤 3：激活流程（每次重启微信前执行一次）
+**微信进程启动、登录窗口→主窗口的 UIA 树初始化期间，若系统里有任何 UIA
+客户端进程（wx_sender/wx_listener 的 COM 连接或重试循环、任何 pywinauto
+探针）向它发起连接，微信会拒绝加载完整 UIA 树**——此后主窗口空壳
+（`mmui::MainWindow` 子元素=2）、小窗不可读，**且无论再怎么重启微信都救不回**
+（毒源客户端进程还活着），表现为"微信 UIA 永久死亡"。
 
-1. 启动 NVDA（静默、无对话框）：`D:\VibeCoding\nvda\portable\nvda.exe --disable-speech -m`
-   （退出用 `nvda.exe -q`）
-2. 关闭微信：`taskkill /F /IM Weixin.exe /T`（连同 `WeChatAppEx.exe`）
-3. 启动微信 → 出现登录窗口后**把窗口带到前台**（NVDA 只注入前台焦点窗口）
-4. 扫码登录。主窗口创建时已带注入状态 → UIA 完整暴露
+2026-09-01 事故复盘：链路 14 天正常（从未在服务运行时杀过微信）→ 21:19
+首次杀微信做实验，wx_sender/wx_listener 的僵尸 COM 连接从此毒死每一个新
+微信进程 → 通宵排查 NVDA 参数/扫码登录/console 会话/系统重启全部无效
+（每轮重启微信时毒源都在场）→ 最终杀光全部 python 客户端、零客户端环境
+重启微信，树立即恢复。
 
-验证（可选）：`python verify_uia.py` —— 主窗口 `mmui::MainWindow` 有大量子元素、
-Weixin.exe 显示"注入 N DLL" 即成功（若 `主窗口只有 2 个子元素` = 未激活，从第 1 步重来）。
+**铁律（违反=复现事故）：**
+
+1. **永远不要在 wx_sender/wx_listener 运行时直接杀微信重启。** 顺序必须是：
+   停服务（杀 python）→ 杀微信 → 启动微信 → 等登录+树活（`wx_login_click.py`
+   exit=0）→ 再起服务。桌面一键入口 `start_all.ps1` 的 exit=2 分支已内置此顺序。
+2. **服务进程自带闸门**：`wx_common.wait_wechat_ready()`（纯 Win32
+   EnumWindows 探测"标题=微信且宽≥500 的可见窗口"=主窗口出现，不碰 COM），
+   listener/sender 启动时先等微信就绪+15s 稳定期，再初始化自己的 UIA——
+   开机自启时无论谁先启动都不会污染微信。改这两个服务时**必须保留闸门**。
+3. **微信的 Win32 类名是 `Qt51514QWindowIcon`**（`mmui::*` 只是 UIA 层名字，
+   `FindWindowW` 按类名找不到微信，必须按 标题+宽度+进程名 判定）。
+4. 树死诊断口诀：**先问"微信启动时谁在场"**——杀光全部 python（含探针/
+   watcher）再重启微信，活了=客户端污染；还死才考虑别的。NVDA/会话类型/
+   登录路径/系统重启都与树死活无关（均已实验排除）。
+5. 注意：**主窗口树空心但小窗树正常（能读到 ListItem）时链路功能是活的**——
+   listener 只依赖小窗。判断链路死活看 `mmui::ChatSingleWindow` 能否读到
+   ListItem，别只盯主窗口 children 数。
+
+## 步骤 3：重启微信的正确流程（替代旧的"NVDA 激活流程"）
+
+1. 停服务：杀掉所有 `wx_sender_server|wx_listener` 的 python 进程
+   （以及任何还开着的 pywinauto 探针脚本）
+2. 关微信：`taskkill /F /IM Weixin.exe /T`
+3. 启动微信：`"C:\Program Files\Tencent\Weixin\Weixin.exe" -autorun`
+4. 登录：自动登录生效时跑 `python wx_login_click.py`（等登录窗、点
+   「进入微信」、验证主窗树，exit 0=好）；没开自动登录则手机扫码
+5. 树活后再起服务：`wscript wx_sender_hidden.vbs` → 5s →
+   `wscript wx_listener_hidden.vbs`
+
+验证：`mmui::ChatSingleWindow` 窗口能读到 ListItem = 收发链路正常
+（主窗口 `mmui::MainWindow` 子元素=2 且小窗正常**不算事故**，见上文第 5 条）。
 
 ## 步骤 4：填写群名映射
 
@@ -183,33 +215,33 @@ wsl ssh root@91.98.134.93 "tail -f /opt/1panel/tools/supervisord/log/coinMarker.
   日志会以 10 分钟一次的频率提示
 - 日志：`rdp_keepalive.log`（gitignore）
 
-## 常驻与开机自启（2026-08-31 全链路自动版）
+## 常驻与开机自启（2026-09-01 时序安全版）
 
-开机链路由 `wx_boot_autostart` 计划任务（登录触发）编排，`boot_autostart.ps1`
-按序拉起：**NVDA → 10s → 微信(自动登录) → 15s → frpc**。服务任务独立并行，
-靠自身重试循环等到微信就绪，顺序无关。
+开机链路由 `wx_boot_autostart` 计划任务（登录触发）编排，`boot_autostart.ps1`：
 
-1. **前提：Windows 自动登录**——本机账户无密码，开机直入桌面（2026-08-31
-   确认，已满足）。若将来加了密码，需 `netplwiz` 取消"必须输入密码"，
-   否则重启停在登录界面，所有登录触发任务（含 rdp_keepalive）都不会跑
-2. 微信已开启「自动登录」，登录窗口出现即自动登录，无需扫码；微信自身的
-   注册表 Run 自启项**已删除**，启动统一由 boot 链负责——避免微信抢在
-   NVDA 之前启动导致 UIA 失活（NVDA 必须先于微信运行，见步骤 3）
-3. 计划任务（需提权执行一次 `setup_autostart.ps1`，幂等）：
-   - `wx_boot_autostart` → `boot_autostart_hidden.vbs`（NVDA→微信→frpc 编排）
-   - `wx_sender_autostart` → `wx_sender_hidden.vbs`
-   - `wx_listener_autostart` → `wx_listener_hidden.vbs`
-4. 启动文件夹已清理：删 `wx_sender.lnk`（与任务重复双启动）、
-   `wx_forwarder.lnk`（chatlog 实验链，开机复活会与 wx_listener **双发消息**；
-   脚本本体保留，手动仍可跑）
-5. 日志：`boot_autostart.log`（gitignore）
+**微信（自身 HKCU Run 自启，"Weixin -autorun"）→ boot 链等它出现(45s,兜底
+拉起) → frpc → wx_login_click.py（登录点击+树验证）→ 树活后才拉
+wx_sender → wx_listener**
+
+1. **前提：Windows 自动登录**——本机账户无密码，开机直入桌面。若将来加了
+   密码需 `netplwiz` 取消"必须输入密码"，否则重启停在登录界面，所有登录
+   触发任务（含 rdp_keepalive）都不会跑
+2. **微信自身注册表 Run 自启项（HKCU ...Run 的 `Weixin` = `"...Weixin.exe"
+   -autorun`）必须保留**——它是微信启动的正主（2026-08-31 曾误删过，
+   09-01 恢复）
+3. NVDA 已退役（见步骤 2）；独立的服务自启任务 `wx_sender_autostart`/
+   `wx_listener_autostart` 已废弃，改由 boot 链在树活后统一拉起（服务自身
+   另有 `wait_wechat_ready` 闸门双保险，旧任务残留也不会出事；提权跑一次
+   `setup_autostart.ps1` 可清理）
+4. 启动文件夹已清理：删 `wx_sender.lnk`（重复双启动）、`wx_forwarder.lnk`
+   （chatlog 实验链，复活会与 wx_listener **双发消息**；脚本本体保留）
+5. 日志：`boot_autostart.log`、手动一键入口 `start_all.log`（gitignore）
 
 重启后验证：
-- `type boot_autostart.log` —— 三组件各一行 started/already running
-- `python verify_uia.py` —— 主窗口子元素正常 = UIA 注入成功（自动登录的
-  登录窗需为前台；万一失活，按步骤 3 重启一次微信即可恢复）
-- 服务器端 supervisor 各程序均 `autostart=true`（coinMarker/tgMoni/
-  previewWeb/chain_vegas），服务器重启自动恢复价格监控，无需人工干预
+- `type boot_autostart.log` —— login exit=0 后 sender/listener 两行 launched
+- `mmui::ChatSingleWindow` 能读到 ListItem = 收发链路正常
+- 服务器端 supervisor 各程序均 `autostart=true`，服务器重启自动恢复
+  价格监控，无需人工干预
 
 物理断电后自动开机需 BIOS 设 AC Power Loss → Power On（主板选项，远程改不了）。
 
