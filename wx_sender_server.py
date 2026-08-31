@@ -86,7 +86,6 @@ DEFAULT_CONFIG = {
         '44456629368@chatroom': {'name': '', 'at_all': False, 'desc': 'Fangchengshi 方程式新闻'},
         '50587746113@chatroom': {'name': '', 'at_all': False, 'desc': 'Twitter 推特监控'},
         '18743464752@chatroom': {'name': '', 'at_all': False, 'desc': 'Aming 推特监控'},
-        '50603160956@chatroom': {'name': '', 'at_all': False, 'desc': 'tgMoni AI 快讯'},
         '49568875761@chatroom': {'name': '', 'at_all': False, 'desc': 'FLJXGJH 封狼居胥冠军侯'},
         'wxid_xerhivsxr9u6':    {'name': '', 'at_all': False, 'desc': 'Xiaokang 私聊'},
     },

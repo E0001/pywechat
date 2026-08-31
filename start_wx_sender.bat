@@ -7,7 +7,7 @@ rem 前置: 微信已按 NVDA 激活流程重启并登录(见文档步骤3)
 rem ============================================================
 
 rem NVDA 便携版路径(按部署机实际路径修改)
-set "NVDA_PATH=D:\VibeCoding\nvda\portable\nvda.exe"
+set "NVDA_PATH=C:\Users\kk\nvda\portable\nvda.exe"
 rem Python: 优先用项目 venv, 不存在则用系统 python
 set "PY=%~dp0.venv\Scripts\python.exe"
 if not exist "%PY%" set "PY=python"
