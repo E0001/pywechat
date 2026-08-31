@@ -183,16 +183,34 @@ wsl ssh root@91.98.134.93 "tail -f /opt/1panel/tools/supervisord/log/coinMarker.
   日志会以 10 分钟一次的频率提示
 - 日志：`rdp_keepalive.log`（gitignore）
 
-## 常驻与开机自启（已配置）
+## 常驻与开机自启（2026-08-31 全链路自动版）
 
-用任务计划程序设置开机任务，顺序必须是 **NVDA → 微信(人工扫码) → 服务**：
+开机链路由 `wx_boot_autostart` 计划任务（登录触发）编排，`boot_autostart.ps1`
+按序拉起：**NVDA → 10s → 微信(自动登录) → 15s → frpc**。服务任务独立并行，
+靠自身重试循环等到微信就绪，顺序无关。
 
-1. `start_wx_sender.bat` 已处理 NVDA 自动拉起与服务启动
-2. 微信需人工扫码登录一次（登录状态一般可保持数天）
-3. 已注册计划任务（登录时触发，需提权执行一次 `setup_autostart.ps1`，幂等）：
+1. **前提：Windows 自动登录**（`netplwiz` 取消"必须输入密码"）——未开启时
+   重启停在登录界面，所有登录触发任务（含 rdp_keepalive）都不会跑
+2. 微信已开启「自动登录」，登录窗口出现即自动登录，无需扫码；微信自身的
+   注册表 Run 自启项**已删除**，启动统一由 boot 链负责——避免微信抢在
+   NVDA 之前启动导致 UIA 失活（NVDA 必须先于微信运行，见步骤 3）
+3. 计划任务（需提权执行一次 `setup_autostart.ps1`，幂等）：
+   - `wx_boot_autostart` → `boot_autostart_hidden.vbs`（NVDA→微信→frpc 编排）
    - `wx_sender_autostart` → `wx_sender_hidden.vbs`
    - `wx_listener_autostart` → `wx_listener_hidden.vbs`
-4. frpc（部署机合一后由本机 `C:\Users\kk\Desktop\frpc\frpc_hidden.vbs` 承载 `wx` 代理）
+4. 启动文件夹已清理：删 `wx_sender.lnk`（与任务重复双启动）、
+   `wx_forwarder.lnk`（chatlog 实验链，开机复活会与 wx_listener **双发消息**；
+   脚本本体保留，手动仍可跑）
+5. 日志：`boot_autostart.log`（gitignore）
+
+重启后验证：
+- `type boot_autostart.log` —— 三组件各一行 started/already running
+- `python verify_uia.py` —— 主窗口子元素正常 = UIA 注入成功（自动登录的
+  登录窗需为前台；万一失活，按步骤 3 重启一次微信即可恢复）
+- 服务器端 supervisor 各程序均 `autostart=true`（coinMarker/tgMoni/
+  previewWeb/chain_vegas），服务器重启自动恢复价格监控，无需人工干预
+
+物理断电后自动开机需 BIOS 设 AC Power Loss → Power On（主板选项，远程改不了）。
 
 ## 运维说明
 
