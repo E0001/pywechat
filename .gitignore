@@ -1,7 +1,16 @@
-"__pycache__/"
-"*.pyc"
-"*.venv"
+__pycache__/
+*.pyc
+*.venv
 
 # wx_sender 运行产物（含消息内容，禁止入库）
 wx_sender.log*
 wx_sender_config.json
+
+# 隐私截图与本地环境文件（截图含聊天内容/头像，frpc 含隧道配置）
+debug_shots/
+debug_*.png
+frpc-wx.toml
+
+# 构建与运行产物
+*.egg-info/
+courgette.log
