@@ -138,6 +138,12 @@ wsl ssh root@91.98.134.93 "tail -f /opt/1panel/tools/supervisord/log/coinMarker.
   冷却内请求返回 `{"queued":false,"skipped":"cooldown","retry_after":n}`（Go 侧视为成功）
 - 按钮定位用 `auto_id='voip_button'`——pyweixin 库 `Call.voice_call` 写死的
   title='语音聊天' 在微信 4.1.2.17 已改文案「语音通话」，故自实现（diag_voice2.py 探明）
+- **拨号是两步操作**（2026-08-31 补，diag_voice8 实测）：点 `voip_button` 只会弹出
+  「语音通话/视频通话」飞出菜单，必须再点菜单里的「语音通话」MenuItem 才真正发起
+  （只点按钮=假拨号，日志会显示成功但对方收不到）。以 `mmui::VOIPWindow` 出现为
+  成功判据，未出现视为失败、不进冷却。拨号优先复用 listener 常驻的独立小窗。
+- ⚠️ 键鼠自动化（含拨号和文本发送）依赖**交互式桌面**：RDP 断开/最小化会话锁屏时
+  `SetCursorPos` 报 "no active desktop"，全部发送失败。RDP 需保持连接。
 - 服务器开关：`.env` 的 `PYWX_VOICE_ALERT_WXIDS`（逗号分隔，空=全关），改后需重启 coinMarker
 
 ## 常驻与开机自启（已配置）

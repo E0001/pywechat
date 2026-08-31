@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pyweixin import Messages, Navigator  # noqa: E402
 from pyweixin.Config import GlobalConfig  # noqa: E402
+import pywinauto  # noqa: E402  语音拨号的飞出菜单/VOIPWindow 检测
 import wx_common  # noqa: E402  发送回声记录(与 wx_listener 共享)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -142,15 +143,10 @@ class SendWorker(threading.Thread):
                         self.voice_skipped += 1
                         logger.info('语音冷却中(%ds) → %s，跳过', left, job['name'])
                     else:
-                        # 不用 pyweixin 的 Call.voice_call：其按钮选择器写死
-                        # title='语音聊天'，在微信 4.1.2.17 已改为「语音通话」。
-                        # auto_id='voip_button' 跨版本更稳（diag_voice2.py 探明）。
-                        main_window = Navigator.open_dialog_window(friend=job['name'])
-                        main_window.child_window(control_type='Button',
-                                                 auto_id='voip_button').click_input()
+                        self._dial_voice(job)
                         self.voice_calls += 1
                         self.last_voice_at[job['to']] = time.time()
-                        logger.info('已拨打语音 → %s', job['name'])
+                        logger.info('已拨打语音 → %s (通话窗口已确认)', job['name'])
                 else:
                     self._send_text(job)
             except Exception as e:
@@ -169,6 +165,73 @@ class SendWorker(threading.Thread):
                                    self.consecutive_fails, cfg.get('fail_cooldown', 60))
                     time.sleep(cfg.get('fail_cooldown', 60))
                     self.consecutive_fails = 0
+
+    def _dial_voice(self, job):
+        '''
+        语音拨号(两步): 点 voip_button 只会弹出「语音通话/视频通话」飞出菜单
+        (微信 4.1.2.17 实测, diag_voice8.py 探明——此前只点按钮导致 4 次假拨号),
+        必须再点菜单里的「语音通话」MenuItem 才真正发起; 最后以 VOIPWindow
+        出现为准, 未出现视为失败(计连续失败, 不进冷却)。
+        '''
+        desktop = pywinauto.Desktop(backend='uia')
+
+        # 优先复用 listener 常驻的独立聊天小窗(免搜索导航, 少抢键鼠);
+        # 找不到再走主窗口导航。小窗标题不可靠(多为 'Weixin'), 靠窗内
+        # 「好友备注名」文本识别。
+        chat = None
+        for w in desktop.windows(class_name='mmui::ChatSingleWindow'):
+            try:
+                for c in w.descendants():
+                    try:
+                        if c.window_text() == job['name']:
+                            chat = w
+                            break
+                    except Exception:
+                        pass
+                if chat:
+                    break
+            except Exception:
+                pass
+        if chat:
+            spec = desktop.window(handle=chat.handle)
+        else:
+            spec = Navigator.open_dialog_window(friend=job['name'])
+
+        spec.set_focus()
+        time.sleep(0.3)
+        btn = spec.child_window(control_type='Button', auto_id='voip_button')
+        btn.click_input()
+
+        # 第二步: 在微信(mmui*)窗口里找飞出菜单的「语音通话」MenuItem
+        item = None
+        deadline = time.time() + 3
+        while time.time() < deadline and item is None:
+            for w in desktop.windows():
+                if not (w.element_info.class_name or '').startswith('mmui'):
+                    continue
+                try:
+                    for mi in w.descendants(control_type='MenuItem'):
+                        if mi.window_text() == '语音通话' and mi.is_visible():
+                            item = mi
+                            break
+                except Exception:
+                    pass
+                if item:
+                    break
+            if item is None:
+                time.sleep(0.3)
+        if item is None:
+            raise RuntimeError('语音飞出菜单 3s 内未出现(voip_button 点击未生效?)')
+        item.click_input()
+
+        # 以 VOIPWindow 出现为成功判据(「等待对方接受邀请」面板)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            for w in desktop.windows():
+                if (w.element_info.class_name or '') == 'mmui::VOIPWindow':
+                    return
+            time.sleep(0.5)
+        raise RuntimeError('点击菜单项后 5s 内未出现通话窗口(VOIPWindow)')
 
     def _send_text(self, job):
         Messages.send_messages_to_friend(
