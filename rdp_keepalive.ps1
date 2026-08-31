@@ -5,12 +5,17 @@
 # dead (SetCursorPos -> "no active desktop"); 2026-08-31 21:23 messages
 # were received but replies all failed for exactly this reason.
 #
-# Every 15s probe the desktop; when not interactive and the session still
-# sits on rdp-tcp*, run: tscon <sessionId> /dest:console  -> the session
-# re-attaches to the physical console and stays interactive. Reconnecting
-# via RDP moves it back; minimizing again makes this script switch again.
+# Every 15s probe the desktop; when not interactive, unconditionally run:
+#   tscon <sessionId> /dest:console
+# -> the session re-attaches to the physical console and stays interactive.
+# Reconnecting via RDP moves it back; minimizing again makes this script
+# switch again. Do NOT gate on the session name: a DISCONNECTED session
+# row in qwinsta has an EMPTY session-name column, so name-based matching
+# missed it (2026-08-31 22:27 outage: dead desktop for 5+ min because the
+# name resolved to the username 'kk' instead of 'rdp-tcp*').
 #
-# Limit: a locked console (Win+L) cannot be auto-recovered.
+# Limit: a locked console (Win+L) cannot be auto-recovered; tscon fails,
+# throttled log every 10 min.
 # Deploy: scheduled task rdp_keepalive (logon trigger, highest privileges,
 # hidden, no execution time limit).
 
@@ -50,16 +55,16 @@ $lastNoFix = [datetime]::MinValue
 while ($true) {
     try {
         if (-not (Test-Desktop)) {
+            $id = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
             $name = Get-MySessionName
-            if ($name -like 'rdp-tcp*') {
-                $id = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
-                Log "desktop dead (session=$name), tscon $id /dest:console"
-                $r = & tscon $id /dest:console 2>&1
-                Log "  tscon: $r"
+            $r = & tscon $id /dest:console 2>&1
+            Start-Sleep -Seconds 2
+            if (Test-Desktop) {
+                Log "desktop dead (session=$name), tscon $id /dest:console -> recovered"
             } elseif (((Get-Date) - $lastNoFix).TotalMinutes -ge 10) {
-                # states we cannot auto-fix (e.g. locked console): log at most
-                # once per 10 minutes to avoid flooding
-                Log "desktop dead but session=$name (not RDP, maybe locked console)"
+                # tscon could not fix it (e.g. locked console): keep retrying
+                # silently every cycle, log at most once per 10 minutes
+                Log "desktop still dead after tscon (session=$name): $r"
                 $lastNoFix = Get-Date
             }
         }

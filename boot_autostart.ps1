@@ -10,7 +10,9 @@
 # is the single launcher and there is no race at logon.
 #
 # Chain: NVDA -> 10s -> WeChat (auto-login, enabled on phone side)
-#        -> 15s -> frpc tunnel (wx 15000).
+#        -> 15s -> frpc tunnel (wx 15000) -> wx_login_click.py
+#        (login button click LAST: it blocks up to ~4 min waiting for the
+#        login window, frpc must not wait behind it).
 # wx_sender / wx_listener / rdp_keepalive have their own ONLOGON tasks
 # and keep retrying until WeChat is ready, so they can start in any
 # order relative to this chain.
@@ -55,6 +57,20 @@ if (-not (Get-Process -Name frpc -ErrorAction SilentlyContinue)) {
     Log 'frpc launched via frpc_hidden.vbs'
 } else {
     Log 'frpc already running'
+}
+
+# 4) login click - auto-login still shows an "Enter WeChat" button that
+#    must be clicked once. Single-pass, never kills WeChat (account
+#    safety). Exit 2 = UIA tree dead -> needs a system reboot, logged.
+$py = 'C:\Users\kk\Desktop\xx\pywechat\.venv\Scripts\python.exe'
+$clicker = 'C:\Users\kk\Desktop\xx\pywechat\wx_login_click.py'
+if ((Test-Path $py -PathType Leaf) -and (Test-Path $clicker -PathType Leaf)) {
+    Log 'wx_login_click starting'
+    $out = & $py $clicker 2>&1
+    $out | ForEach-Object { Log "[login] $_" }
+    Log "wx_login_click exit=$LASTEXITCODE"
+} else {
+    Log 'WARN: venv python or wx_login_click.py missing, login button not clicked'
 }
 
 Log 'boot chain done'
