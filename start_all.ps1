@@ -27,6 +27,15 @@ Log "=== 一键启动开始 ==="
 
 # 1) WeChat (if not running - normally its own Run entry handles logon)
 if (-not (Get-Process Weixin -ErrorAction SilentlyContinue)) {
+    # 微信不在跑: 若服务还活着必须先停——微信 UIA 树初始化期间有 UIA
+    # 客户端在场会永久毒死树(2026-09-01 事故, 见 DEPLOY_WX_SENDER.md),
+    # 顺序绝不可反。停掉的服务由步骤 4/5 在树活后重新拉起。
+    $svc = Get-PyScript 'wx_sender_server|wx_listener'
+    if ($svc) {
+        Log "[1/5] 微信未运行, 先停 wx_sender/wx_listener (防 UIA 污染)..."
+        $svc | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 3
+    }
     Start-Process 'C:\Program Files\Tencent\Weixin\Weixin.exe' -ArgumentList '-autorun'
     Log "[1/5] 微信已启动, 等待 15s..."
     Start-Sleep -Seconds 15
@@ -75,7 +84,6 @@ switch ($LASTEXITCODE) {
             else { Log "      ✗ 重启后仍未激活(记录 start_all.log, 找 Claude 诊断)" }
         }
     }
-}
 
 # 4) wx_sender - HTTP :15000
 if (-not (Get-PyScript 'wx_sender_server')) {
@@ -93,6 +101,7 @@ if (-not (Get-PyScript 'wx_listener')) {
     Log "[5/5] wx_listener 已在运行"
 }
 
-Start-Sleep -Seconds 2
-$healthy = Test-Path "$dir\wx_sender.log"
-Log "=== 完成。端口 15000 监听: $((Get-NetTCPConnection -LocalPort 15000 -State Listen -ErrorAction SilentlyContinue) -ne $null); 详见 start_all.log ==="
+Start-Sleep -Seconds 3
+Log "=== 链路健康检查 ==="
+& $py "$dir\wx_health.py"
+Log "=== 一键启动完成 (健康检查 exit=$LASTEXITCODE; 0=链路正常) ==="
