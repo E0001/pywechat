@@ -201,27 +201,29 @@ class SendWorker(threading.Thread):
         '''
         desktop = pywinauto.Desktop(backend='uia')
 
-        # 优先复用 listener 常驻的独立聊天小窗(免搜索导航, 少抢键鼠);
-        # 找不到再走主窗口导航。小窗标题不可靠(多为 'Weixin'), 靠窗内
-        # 「好友备注名」文本识别。
-        chat = None
-        for w in desktop.windows(class_name='mmui::ChatSingleWindow'):
+        # 优先按句柄注册表复用 listener 常驻的独立聊天小窗(免搜索导航,
+        # 少抢键鼠); 句柄失效(小窗被关/微信重启)则按当前可寻址名重开并回写
+        # 新句柄。旧实现遍历窗口找「配置备注名」文本, 用户一改备注即失联。
+        to = job.get('to', '')
+        spec = None
+        hwnd = wx_common.get_chat_hwnd(to) if to else 0
+        if hwnd:
             try:
-                for c in w.descendants():
-                    try:
-                        if c.window_text() == job['name']:
-                            chat = w
-                            break
-                    except Exception:
-                        pass
-                if chat:
-                    break
+                cand = desktop.window(handle=hwnd)
+                if cand.exists(timeout=1) and \
+                        cand.element_info.class_name == 'mmui::ChatSingleWindow':
+                    spec = cand
+            except Exception:
+                spec = None
+        if spec is None:
+            term = (wx_common.get_contact_name(to) or job['name']) if to else job['name']
+            if to and term != job['name']:
+                logger.info('备注名已变化, 按新名开窗拨号: %s → %s', job['name'], term)
+            spec = Navigator.open_dialog_window(friend=term)
+            try:
+                wx_common.set_chat_hwnd(to, spec.handle)
             except Exception:
                 pass
-        if chat:
-            spec = desktop.window(handle=chat.handle)
-        else:
-            spec = Navigator.open_dialog_window(friend=job['name'])
 
         spec.set_focus()
         time.sleep(0.3)
@@ -260,8 +262,17 @@ class SendWorker(threading.Thread):
         raise RuntimeError('点击菜单项后 5s 内未出现通话窗口(VOIPWindow)')
 
     def _send_text(self, job):
+        # 私聊目标搜索词优先用追踪到的当前备注名(用户改备注后仍可寻址,
+        # 微信搜索框搜不到 wxid——实测 NoSuchFriendError); 群聊仍按群显示名
+        to = job.get('to', '')
+        if to and '@chatroom' not in to:
+            term = wx_common.get_contact_name(to) or job['name']
+            if term != job['name']:
+                logger.info('备注名已变化, 按新名发送: %s → %s', job['name'], term)
+        else:
+            term = job['name']
         Messages.send_messages_to_friend(
-            friend=job['name'],
+            friend=term,
             messages=[job['content']],
             at_all=job['at_all'],
         )

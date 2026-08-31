@@ -25,3 +25,7 @@ wx_sent_echo.jsonl
 wx_inbound_seen.jsonl
 .lock-*
 rdp_keepalive.log
+
+# 运行时注册表缓存(自动重建)
+wx_contact_names.json
+wx_chat_windows.json

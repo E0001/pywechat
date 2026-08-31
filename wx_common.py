@@ -132,3 +132,80 @@ def _maybe_truncate(path: str = ECHO_FILE) -> None:
             f.writelines(lines[-_KEEP_LINES:])
     except OSError:
         pass
+
+
+# ---- 联系人当前可搜索名 / 聊天窗口句柄 注册表 ----
+# 微信搜索框搜不到内部 wxid（实测 NoSuchFriendError），开窗/发送只能按
+# 显示名（备注名）搜索。用户改备注后配置里的旧名字会失联，故 wx_listener
+# 在窗口存续期间持续追踪聊天窗口头部显示名并落盘；重连/发送/拨号优先
+# 用这里的新名字。句柄表用于拨号免搜索复用 listener 常驻小窗。
+CONTACTS_FILE = os.path.join(_BASE, 'wx_contact_names.json')  # wxid -> 当前备注名
+WINDOWS_FILE = os.path.join(_BASE, 'wx_chat_windows.json')    # wxid -> 窗口句柄
+
+
+def _read_json(path: str) -> dict:
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_json(path: str, data: dict) -> None:
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def get_contact_name(wxid: str) -> str:
+    return str(_read_json(CONTACTS_FILE).get(wxid, ''))
+
+
+def set_contact_name(wxid: str, name: str) -> None:
+    if not name:
+        return
+    try:
+        data = _read_json(CONTACTS_FILE)
+        if data.get(wxid) != name:
+            data[wxid] = name
+            _write_json(CONTACTS_FILE, data)
+    except OSError:
+        pass
+
+
+def get_chat_hwnd(wxid: str) -> int:
+    try:
+        return int(_read_json(WINDOWS_FILE).get(wxid, 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def set_chat_hwnd(wxid: str, hwnd) -> None:
+    try:
+        hwnd = int(hwnd)
+    except (TypeError, ValueError):
+        return
+    try:
+        data = _read_json(WINDOWS_FILE)
+        if data.get(wxid) != hwnd:
+            data[wxid] = hwnd
+            _write_json(WINDOWS_FILE, data)
+    except OSError:
+        pass
+
+
+def search_terms(wxid: str, alias: str, default: str) -> list:
+    '''
+    搜索词优先级: 追踪到的当前备注名(改备注自愈) → 配置默认名 → 微信号
+    alias(永不变化)。前两者可被 pyweixin 原生直搜; 微信号需两段式寻址
+    (结果条目显示名≠微信号, 详见 wx_listener._discover_name_by_alias),
+    放最后兜底。去重保序。
+    '''
+    seen, out = set(), []
+    for t in (get_contact_name(wxid), default or '', alias or ''):
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out

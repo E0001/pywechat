@@ -48,8 +48,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pyweixin import Navigator, Tools  # noqa: E402
 from pyweixin.Config import GlobalConfig  # noqa: E402
 from pyweixin.Uielements import Lists  # noqa: E402
+from pyweixin.WeChatTools import Main_window, SideBar  # noqa: E402  实例(非类)
 from wx_common import (acquire_instance_lock, is_recent_inbound,  # noqa: E402
-                       is_recent_sent_echo, log_inbound)
+                       is_recent_sent_echo, log_inbound, search_terms,
+                       set_chat_hwnd, set_contact_name)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, 'wx_sender_config.json')
@@ -87,6 +89,7 @@ class Cfg:
     callback_token = ''
     callback_timeout = 5
     callback_retries = 2
+    aliases = {}          # {wxid: 微信号} —— 永不变化且可搜索的最稳寻址词
     robot_wxid = ''       # 固定 robot_wxid(配置优先)。文件夹探测正则对带后缀的
                           # 目录名会截出长短两种变体, 漂移会导致 session 双注册/
                           # 提醒 BotID 混乱, 故生产必须写死
@@ -110,6 +113,7 @@ def load_config() -> bool:
     Cfg.callback_timeout = int(callback.get('timeout', 5))
     Cfg.callback_retries = int(callback.get('max_retries', 2))
     Cfg.robot_wxid = str(callback.get('robot_wxid', '')).strip()
+    Cfg.aliases = cfg.get('aliases') or {}
     if not Cfg.friends:
         logger.error('配置缺少 listener.friends(白名单 wxid→备注名), 退出')
         return False
@@ -205,16 +209,95 @@ def detect_robot_wxid(timeout: float = 120) -> str:
 # 单好友监听线程
 # ============================================================
 
+def _read_header_name(dw) -> str:
+    '''读取聊天窗口头部的当前显示名（用户改备注后此值实时变化）。'''
+    try:
+        for c in dw.descendants(control_type='Text'):
+            aid = c.element_info.automation_id or ''
+            if aid.endswith('current_chat_name_label'):
+                return c.window_text() or ''
+    except Exception:
+        pass
+    return ''
+
+
+def _discover_name_by_alias(alias: str) -> str:
+    '''
+    微信号两段式寻址·第一步: 搜索框输入微信号。微信号永不变化且可搜,
+    但搜索结果条目显示的是备注名——pyweixin 原生按「显示名==搜索词」
+    逐字匹配会误报 NoSuchFriendError(实测 litiantianss/crypto_kang 均如此,
+    微信本身搜得到)。故这里只读结果不点击, 返回第一个联系人条目的
+    显示名(=当前备注名), 交给调用方用它走原生开窗。失败返回 ''。
+    '''
+    try:
+        main_window = Navigator.open_weixin(is_maximize=False)
+        chat_button = main_window.child_window(**SideBar.Weixin)
+        chat_button.click_input()
+        search = main_window.descendants(**Main_window.Search)[0]
+        search.click_input()
+        search.set_text(alias)
+        time.sleep(0.8)
+        results = main_window.child_window(title='', control_type='List')
+        for li in results.children(control_type='ListItem'):
+            if li.class_name() == 'mmui::SearchContentCellView' and li.window_text():
+                return li.window_text()
+    except Exception as e:
+        logger.warning('按微信号 %r 发现显示名失败: %s', alias, e)
+    return ''
+
+
+def _open_friend_window(wxid: str, remark: str):
+    '''
+    三级搜索词依次开窗, 命中即返回 (window, 实际生效的搜索词); 全败抛异常
+    (由 listen_friend 的 backoff 重试兜底):
+    1. 追踪名 —— wx_common 落盘的窗口头部显示名(listener 30s 实时刷新,
+       用户改备注后自动跟进);
+    2. 配置备注名 —— wx_sender_config.json listener.friends 里的名字;
+    3. 微信号两段式 —— 前两者同时失效(改名后旧名全失联)时, 按微信号
+       (aliases 配置, 永不变化)发现当前显示名并落盘, 再用它开窗。
+       只要不删好友, 永远找得回来。
+    '''
+    alias = Cfg.aliases.get(wxid, '')
+    last_err = None
+    for term in search_terms(wxid, alias, remark)[:2]:  # 前两级可直搜
+        try:
+            dw = Navigator.open_seperate_dialog_window(friend=term, window_minimize=True)
+            if term != remark:
+                logger.info('[%s] 按追踪名开窗成功: %s', remark, term)
+            return dw, term
+        except Exception as e:
+            last_err = e
+            logger.warning('[%s] 搜索词 %r 开窗失败: %s', remark, term, e)
+    if alias:
+        logger.info('[%s] 旧名全部失效, 按微信号 %r 两段式寻址', remark, alias)
+        discovered = _discover_name_by_alias(alias)
+        if discovered:
+            logger.info('[%s] 微信号 %r → 当前显示名 %r, 落盘后开窗',
+                        remark, alias, discovered)
+            set_contact_name(wxid, discovered)
+            dw = Navigator.open_seperate_dialog_window(friend=discovered,
+                                                       window_minimize=True)
+            return dw, discovered
+    raise last_err or RuntimeError(f'[{remark}] 无可用搜索词')
+
+
 def listen_friend(wxid: str, remark: str, robot_wxid_holder: dict) -> None:
     '''
     打开该好友独立聊天小窗(最小化)并持续轮询:
     最后一条 ListItem 的 runtime_id 变化 = 新消息。
     窗口丢失/微信重启时自动重开; 重开后 robot_wxid 若变化则重发 10001。
+
+    开窗搜索词三级自愈(见 _open_friend_window): 追踪名 → 配置备注名 →
+    微信号两段式发现。用户改备注/关小窗后无需改配置即可自动找回。
     '''
     backoff = 5
     while True:
         try:
-            dw = Navigator.open_seperate_dialog_window(friend=remark, window_minimize=True)
+            dw, term = _open_friend_window(wxid, remark)
+            try:
+                set_chat_hwnd(wxid, dw.handle)
+            except Exception:
+                pass
             chatList = dw.child_window(**LISTS.FriendChatList)
 
             # 等待消息列表就绪且基线稳定。窗口(重)开时列表渐进渲染——旧消息
@@ -238,7 +321,11 @@ def listen_friend(wxid: str, remark: str, robot_wxid_holder: dict) -> None:
             if initial_rid is None or stable_since is None:
                 raise RuntimeError('消息列表 15s 内未出现稳定基线')
 
-            logger.info('[%s] 监听就绪 (wxid=%s)', remark, wxid)
+            logger.info('[%s] 监听就绪 (wxid=%s, 寻址词=%s)', remark, wxid, term)
+            header = _read_header_name(dw)
+            if header:
+                set_contact_name(wxid, header)
+                term = header
             backoff = 5
 
             # 换号重连后刷新会话注册（robot_wxid 由配置固定时跳过——
@@ -251,6 +338,7 @@ def listen_friend(wxid: str, remark: str, robot_wxid_holder: dict) -> None:
                     robot_wxid_holder['wxid'] = robot_now
                     post_login(robot_now)
 
+            poll_count = 0
             while True:
                 items = chatList.children(control_type='ListItem')
                 if items:
@@ -260,6 +348,13 @@ def listen_friend(wxid: str, remark: str, robot_wxid_holder: dict) -> None:
                         initial_rid = rid
                         _handle_new_item(robot_wxid_holder.get('wxid', ''),
                                          wxid, remark, last)
+                poll_count += 1
+                if poll_count % 60 == 0:  # ~30s 刷新一次显示名(改备注自愈的关键)
+                    header = _read_header_name(dw)
+                    if header and header != term:
+                        logger.info('[%s] 检测到备注名变化: %s → %s', remark, term, header)
+                        set_contact_name(wxid, header)
+                        term = header
                 time.sleep(Cfg.poll_interval)
 
         except Exception as e:

@@ -141,12 +141,33 @@ wsl ssh root@91.98.134.93 "tail -f /opt/1panel/tools/supervisord/log/coinMarker.
 - **拨号是两步操作**（2026-08-31 补，diag_voice8 实测）：点 `voip_button` 只会弹出
   「语音通话/视频通话」飞出菜单，必须再点菜单里的「语音通话」MenuItem 才真正发起
   （只点按钮=假拨号，日志会显示成功但对方收不到）。以 `mmui::VOIPWindow` 出现为
-  成功判据，未出现视为失败、不进冷却。拨号优先复用 listener 常驻的独立小窗。
+  成功判据，未出现视为失败、不进冷却。拨号优先按句柄注册表复用 listener 常驻的
+  独立小窗（免搜索导航，1s 内拨出；失效则按当前可寻址名重开并回写句柄）。
 - ⚠️ 键鼠自动化（含拨号和文本发送）依赖**交互式桌面**：RDP 断开/最小化会话锁屏时
   `SetCursorPos` 报 "no active desktop"，全部发送失败。**已由 rdp_keepalive 根治**（见下节）。
 - 发送任务失败自动重试 3 次（间隔 60s，`_requeue_later`），桌面短暂抖动/UIA 偶发冲突
   不再永久丢消息（2026-08-31 21:23 事故教训：3 条回复一次性丢弃）
 - 服务器开关：`.env` 的 `PYWX_VOICE_ALERT_WXIDS`（逗号分隔，空=全关），改后需重启 coinMarker
+
+## 改备注/关小窗自愈（2026-08-31 上线）
+
+微信搜索框**搜不到内部 wxid**（逐字匹配失败），开窗/拨号只能按显示名搜索——
+用户一改备注，配置里的旧名字就失联。三层防线让改备注、关小窗都不需要改配置：
+
+| 层 | 机制 | 失效场景 |
+|----|------|---------|
+| 1. 追踪名 | listener 每 30s 读小窗头部 `current_chat_name_label`，实时落盘当前备注名 | 窗口关闭期间被改名 |
+| 2. 配置备注名 | `listener.friends` / `targets` 里的名字 | 名字被改后 |
+| 3. 微信号两段式 | 按微信号搜索（**永不变化且可搜**），读结果条目的显示名（=当前备注名）落盘，再用它开窗 | 只有删好友才失效 |
+
+- 微信号在 config 顶层 `aliases` 块维护：`{"wxid_xerhivsxr9u622": "crypto_kang", "litiantianss": "litiantianss"}`
+- ⚠️ pyweixin 原生搜索要求「结果条目显示名 == 搜索词」，按微信号直搜会误报
+  NoSuchFriendError（微信本身搜得到）——所以微信号必须走 wx_listener
+  `_discover_name_by_alias` 的两段式，不能直接传给 `open_seperate_dialog_window`
+- 落盘注册表：`wx_contact_names.json`（wxid→当前备注名）、`wx_chat_windows.json`
+  （wxid→小窗句柄，拨号复用）。均为运行时缓存，删了会自动重建
+- 发送/拨号侧取「追踪名 → 配置名」，配合 3×60s 重试等 listener 自愈；
+  验证工具：`diag_alias_discovery.py`（确认 alias 能发现当前显示名）
 
 ## rdp_keepalive：无人值守运行（2026-08-31 上线）
 
@@ -182,7 +203,7 @@ wsl ssh root@91.98.134.93 "tail -f /opt/1panel/tools/supervisord/log/coinMarker.
 | 失败冷却 | 连续失败 5 次冷却 60 秒（`fail_threshold`/`fail_cooldown`），多为微信掉线/弹窗遮挡 |
 | 日志 | 控制台 + `wx_sender.log`（2MB 轮转×3），含每条消息目标与前 50 字 |
 | 监听时延 | listener 轮询 0.5s，消息检测→回调通知服务器 ~1s；回复发送另含 3-6s 防检测延迟 |
-| 新增白名单 | 两处同步：config `listener.friends` 加 wxid→备注名 + coinMarker `main.go` switch 加 wxid |
+| 新增白名单 | 三处同步：config `listener.friends` 加 wxid→备注名、`aliases` 加 wxid→微信号（自愈兜底）+ coinMarker `main.go` switch 加 wxid |
 | @所有人 | targets 里 `at_all:true` 的目标（JSSZ 已配）发送时自动 @所有人 |
 | 长消息 | 超过 2000 字自动转 txt 文件发送（pyweixin 内置） |
 | 机器不可锁屏 | 锁屏/休眠/远程断开都会导致 UIA 发送失败，务必配置电源计划 |
