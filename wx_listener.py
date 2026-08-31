@@ -48,7 +48,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pyweixin import Navigator, Tools  # noqa: E402
 from pyweixin.Config import GlobalConfig  # noqa: E402
 from pyweixin.Uielements import Lists  # noqa: E402
-from wx_common import is_recent_sent_echo, acquire_instance_lock  # noqa: E402
+from wx_common import (acquire_instance_lock, is_recent_inbound,  # noqa: E402
+                       is_recent_sent_echo, log_inbound)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, 'wx_sender_config.json')
@@ -216,16 +217,26 @@ def listen_friend(wxid: str, remark: str, robot_wxid_holder: dict) -> None:
             dw = Navigator.open_seperate_dialog_window(friend=remark, window_minimize=True)
             chatList = dw.child_window(**LISTS.FriendChatList)
 
-            # 等待消息列表就绪(刚打开窗口 UIA 树需要一点时间)
+            # 等待消息列表就绪且基线稳定。窗口(重)开时列表渐进渲染——旧消息
+            # 逐条补齐, items[-1] 的 rid 会连续变化, 直接取首见 rid 当基线
+            # 会把渲染补齐的历史消息误判为新消息重复转发(一条命令被转 3 次
+            # 的事故根因)。要求 rid 连续 2s 不变才算稳定; 渲染通常 1-3s 完成。
             initial_rid = None
-            for _ in range(20):
+            stable_since = None
+            deadline = time.time() + 15
+            while time.time() < deadline:
                 items = chatList.children(control_type='ListItem')
                 if items:
-                    initial_rid = items[-1].element_info.runtime_id
-                    break
+                    rid = items[-1].element_info.runtime_id
+                    if rid == initial_rid:
+                        if time.time() - stable_since >= 2.0:
+                            break  # 列表已稳定
+                    else:
+                        initial_rid = rid
+                        stable_since = time.time()
                 time.sleep(0.5)
-            if initial_rid is None:
-                raise RuntimeError('消息列表 10s 内无 ListItem')
+            if initial_rid is None or stable_since is None:
+                raise RuntimeError('消息列表 15s 内未出现稳定基线')
 
             logger.info('[%s] 监听就绪 (wxid=%s)', remark, wxid)
             backoff = 5
@@ -280,9 +291,21 @@ def _handle_new_item(robot_wxid: str, wxid: str, remark: str, item) -> None:
     if is_recent_sent_echo(wxid, text):
         logger.info('[%s] 自家回声, 忽略: %.30s', remark, text)
         return
+    # 窗口重连/重绘后 runtime_id 集体变化，历史消息会被误判为新消息重复转发
+    # （曾导致一条命令被转发 3 次、提醒反复重设重触发）。60s 内相同
+    # (wxid, text) 已转发过则跳过；60s 后正常重发命令不受影响。
+    if is_recent_inbound(wxid, text):
+        logger.info('[%s] 60s 内已转发过相同内容, 疑似重连误报, 忽略: %.30s',
+                    remark, text)
+        return
     logger.info('[%s] 新消息: %.50s', remark, text)
     payload = build_private_message(robot_wxid, wxid, remark, text)
-    if not post_event(payload):
+    if post_event(payload):
+        try:
+            log_inbound(wxid, text)
+        except OSError as e:
+            logger.warning('[%s] 转发去重记录失败(不影响上报): %s', remark, e)
+    else:
         logger.error('[%s] 10002 上报失败(已重试): %.50s', remark, text)
 
 

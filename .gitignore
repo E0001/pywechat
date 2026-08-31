@@ -22,4 +22,5 @@ wx_forwarder_config.json
 # wx_listener 运行产物（echo 文件含消息内容，禁止入库）
 wx_listener.log*
 wx_sent_echo.jsonl
+wx_inbound_seen.jsonl
 .lock-*
