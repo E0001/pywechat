@@ -143,8 +143,24 @@ wsl ssh root@91.98.134.93 "tail -f /opt/1panel/tools/supervisord/log/coinMarker.
   （只点按钮=假拨号，日志会显示成功但对方收不到）。以 `mmui::VOIPWindow` 出现为
   成功判据，未出现视为失败、不进冷却。拨号优先复用 listener 常驻的独立小窗。
 - ⚠️ 键鼠自动化（含拨号和文本发送）依赖**交互式桌面**：RDP 断开/最小化会话锁屏时
-  `SetCursorPos` 报 "no active desktop"，全部发送失败。RDP 需保持连接。
+  `SetCursorPos` 报 "no active desktop"，全部发送失败。**已由 rdp_keepalive 根治**（见下节）。
+- 发送任务失败自动重试 3 次（间隔 60s，`_requeue_later`），桌面短暂抖动/UIA 偶发冲突
+  不再永久丢消息（2026-08-31 21:23 事故教训：3 条回复一次性丢弃）
 - 服务器开关：`.env` 的 `PYWX_VOICE_ALERT_WXIDS`（逗号分隔，空=全关），改后需重启 coinMarker
+
+## rdp_keepalive：无人值守运行（2026-08-31 上线）
+
+本机经 RDP 运维，但 **RDP 客户端最小化或断开后输入桌面失效**，键鼠自动化全部失败
+（会话在 qwinsta 里仍显示"运行中"，极具迷惑性）。`rdp_keepalive.ps1` + 计划任务
+`rdp_keepalive`（登录触发、最高权限、无时限）：
+
+- 每 15s 用 `SetCursorPos` 自检桌面；不可交互且会话在 rdp-tcp 上时执行
+  `tscon <id> /dest:console` 把会话切到物理控制台，恢复交互
+- 已验证：**RDP 完全断开时文本/语音发送照常工作**
+- 用户重连 RDP 会话自动回到 rdp-tcp；再次最小化/断开后 15s 内被切回 console
+- 局限：物理控制台被锁屏（Win+L）无法自动恢复——**别在这台机器上按 Win+L**，
+  日志会以 10 分钟一次的频率提示
+- 日志：`rdp_keepalive.log`（gitignore）
 
 ## 常驻与开机自启（已配置）
 

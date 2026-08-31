@@ -112,6 +112,10 @@ def ensure_config() -> dict:
 
 # ---------------- 发送 worker（单线程，UIA 一次只能操作一个微信窗口） ----------------
 class SendWorker(threading.Thread):
+    RETRY_MAX = 3     # 任务失败重试次数（防桌面抖动/UIA 偶发冲突时消息永久丢失）
+    RETRY_DELAY = 60  # 重试间隔（秒）。2026-08-31 21:23 事故: 桌面失效期间
+                      # 3 条消息一次性丢弃, 提醒被"先删后发"语义消耗后再无重发
+
     def __init__(self, send_queue: queue.Queue):
         super().__init__(daemon=True, name='send-worker')
         self.send_queue = send_queue
@@ -151,9 +155,19 @@ class SendWorker(threading.Thread):
                     self._send_text(job)
             except Exception as e:
                 self.failed_total += 1
-                self.consecutive_fails += 1
                 self.last_error = f'{type(e).__name__}: {e}'
-                logger.error('任务失败(%d 连败) → %s | %s', self.consecutive_fails, job['name'], self.last_error)
+                retry_no = job.get('_retry', 0)
+                if retry_no < self.RETRY_MAX:
+                    job['_retry'] = retry_no + 1
+                    logger.warning('任务失败(第 %d/%d 次), %ds 后重试 → %s | %s',
+                                   retry_no + 1, self.RETRY_MAX, self.RETRY_DELAY,
+                                   job['name'], self.last_error)
+                    self._requeue_later(job)
+                else:
+                    # 重试耗尽才算最终失败，计入连败冷却
+                    self.consecutive_fails += 1
+                    logger.error('任务重试 %d 次仍失败, 放弃 → %s | %s',
+                                 self.RETRY_MAX, job['name'], self.last_error)
             finally:
                 self.send_queue.task_done()
                 interval = load_config().get('send_interval', [3, 6])
@@ -165,6 +179,18 @@ class SendWorker(threading.Thread):
                                    self.consecutive_fails, cfg.get('fail_cooldown', 60))
                     time.sleep(cfg.get('fail_cooldown', 60))
                     self.consecutive_fails = 0
+
+    def _requeue_later(self, job):
+        '''RETRY_DELAY 秒后把失败任务重新入队（独立线程等待，不阻塞队列）。'''
+        def _go():
+            time.sleep(self.RETRY_DELAY)
+            try:
+                self.send_queue.put_nowait(job)
+                logger.info('重试入队(第 %d 次) → %s', job.get('_retry', 0), job['name'])
+            except queue.Full:
+                logger.error('重试入队失败(队列已满), 放弃 → %s', job['name'])
+        threading.Thread(target=_go, daemon=True,
+                         name=f'retry-{job.get("name", "?")}').start()
 
     def _dial_voice(self, job):
         '''
