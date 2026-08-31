@@ -1,359 +1,323 @@
+# -*- coding: utf-8 -*-
 '''
-wx_listener.py —— 白名单好友私聊消息监听 + 回调转发
+wx_listener.py —— 个人微信消息监听转发器
 ================================================
 
-配合 wx_sender_server.py 运行，替代已停用的 StarBot 回调通道：
+接收侧组件（与 wx_sender_server.py 发送侧配套），打通 coinMarker 个人微信
+通道的「收」链路:
 
-    微信客户端（独立聊天窗口）
-        → WhitelistListener（单线程轮询窗口尾部 ListItem 的 runtime_id 增量）
-        → forward_queue → CallbackWorker
-        → POST {callback.url}（StarBot 兼容格式 event="10002"）
-        → coinMarker 91.98.134.93:19600 /wcf/callback
+    好友在手机/PC 发消息 → 本机微信(独立聊天小窗, 最小化)
+        → UIA 轮询检测新消息(runtime_id 变化, 只读不写)
+        → 回声过滤(wx_common: 刚由 wx_sender 发出的内容不算新消息)
+        → POST http://91.98.134.93:19600/wcf/callback  (StarBot 兼容 JSON)
+        → coinMarker starbot 包分发 → 命令处理 → 回复仍走 wx_sender 发送链路
 
-设计要点:
-    1. 不用 Messages.check_new_messages()（红点徽标竞态 + pull 会拉到自己回复），
-       改用独立窗口 + runtime_id 增量监听（同 Monitor.listen_on_chat 的机制，
-       但自实现常驻轮询，单线程串行处理所有白名单窗口）。
-    2. 自回环双层防护：runtime_id 增量 + wx_common.is_recently_sent
-       （SendWorker 发送前登记，本服务发出的回复不会被子转发回 coinMarker）。
-    3. 所有 pyweixin 调用（开窗/置底/读控件）持 wx_common.UIA_LOCK，
-       与 SendWorker 的发送严格串行，避免 UIA 多线程死锁。
-    4. burst 吸收：每轮检查尾部 TAIL_SCAN 个 item 的 runtime_id，
-       两次轮询间连发的多条消息不会只识别到最后一条。
-    5. 窗口被误关/微信重启 → watchdog 限频重开（REOPEN_COOLDOWN 秒），
-       重开后把当前尾部消息记为已见（历史消息不转发）。
+协议(与 coin-marker/starbot/types.go 严格一致):
+    event="10001" 登录成功  data:{robotId, nickname}
+    event="10002" 私聊消息  data:{robotId, fromType:"private", fromWxId,
+                              fromNickName, message, timeStamp(ms),
+                              messageId:"{robot}-{ts}-{hash8}", messageType:1,
+                              messageSource:0, toWxId, isPc:1}
+    鉴权: Authorization: Bearer <token> (与 starbot/server.go 一致)
 
-配置（wx_sender_config.json）:
-    "listener": {"enabled": true, "poll_interval": 1.5,
-                 "friends": {"<好友wxid>": "<好友备注/显示名，必须完整精确>"}}
-    "callback": {"url": "http://91.98.134.93:19600/wcf/callback",
-                 "token": "...", "robot_wxid": "", "timeout": 5, "max_retries": 3}
+设计取舍(v1):
+    - 只读 UIA: 不 activate_chatList(它内部是鼠标点击+END键, 会与 wx_sender
+      的 pyautogui 抢输入), 不 restore 窗口, 不右键 is_my_bubble(侵入式)。
+      自家消息识别改用 wx_common 发送记录匹配。
+    - pyweixin 官方多好友示例即「最小化窗口监听」模式, 检测路径无需还原窗口。
+    - 已知限制: 两次轮询间连发多条消息只能看到最后一条(poll 0.5s, 窗口很小);
+      手机端登录本人账号给白名单好友发消息会被误认为对方消息(无法区分)。
+    - 窗口关闭/微信重启: 线程内自动重开小窗并续传; robot_wxid 变化(换号登录)
+      会重发 10001 重新注册。
+
+配置: 同目录 wx_sender_config.json 的 listener + callback 块(见 README)。
+运行: python wx_listener.py  (常驻; 建议用 wx_listener_hidden.vbs 隐藏启动)
 '''
 
+import hashlib
 import json
 import logging
-import queue
+import os
+import sys
 import threading
 import time
-import urllib.error
 import urllib.request
-from collections import deque
 
-from pyweixin import Navigator, Tools, SystemSettings  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from pyweixin import Navigator, Tools  # noqa: E402
+from pyweixin.Config import GlobalConfig  # noqa: E402
 from pyweixin.Uielements import Lists  # noqa: E402
+from wx_common import is_recent_sent_echo  # noqa: E402
 
-from wx_common import UIA_LOCK, is_recently_sent  # noqa: E402
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, 'wx_sender_config.json')
 
-logger = logging.getLogger('wx_sender')
+# 常驻服务绝不关闭微信
+GlobalConfig.close_weixin = False
 
-# 微信文本消息 ListItem 的 UIA 类名
-TEXT_ITEM_CLASS = 'mmui::ChatTextItemView'
-# 每轮轮询检查尾部 item 数（burst 吸收：两次轮询间连发多条也能逐条识别）
-TAIL_SCAN = 5
-# 每窗口记住的最近 runtime_id 数量（超出即淘汰，防内存增长）
-RID_MEMORY = 16
-# 窗口失效（被关/微信重启）后的重开冷却秒数
-REOPEN_COOLDOWN = 60
-# 回调重试退避间隔（秒）
-RETRY_BACKOFF = [2, 4, 8]
+# ---------------- 日志 ----------------
+logger = logging.getLogger('wx_listener')
+logger.setLevel(logging.INFO)
+_fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+_console = logging.StreamHandler()
+_console.setFormatter(_fmt)
+logger.addHandler(_console)
+try:
+    from logging.handlers import RotatingFileHandler
+    _file = RotatingFileHandler(os.path.join(BASE_DIR, 'wx_listener.log'),
+                                maxBytes=2 * 1024 * 1024, backupCount=3, encoding='utf-8')
+    _file.setFormatter(_fmt)
+    logger.addHandler(_file)
+except Exception:
+    pass
 
-
-class ForwardMsg:
-    '''一条待转发的白名单私聊消息'''
-
-    __slots__ = ('wxid', 'name', 'text', 'msg_id', 'ts_ms')
-
-    def __init__(self, wxid: str, name: str, text: str, ts_ms: int):
-        self.wxid = wxid
-        self.name = name
-        self.text = text
-        self.ts_ms = ts_ms
-        self.msg_id = f'{wxid}-{ts_ms}-{hash(text) & 0xFFFFFF:x}'
+LISTS = Lists()
 
 
-class _FriendState:
-    '''单个白名单好友的监听状态'''
+# ============================================================
+# 配置
+# ============================================================
 
-    __slots__ = ('wxid', 'name', 'window', 'chatList', 'seen_rids',
-                 'last_msg_at', 'reopen_at', 'last_error')
-
-    def __init__(self, wxid: str, name: str):
-        self.wxid = wxid
-        self.name = name
-        self.window = None       # pywinauto WindowSpecification，None 表示待（重）开
-        self.chatList = None     # 消息列表控件（Lists.FriendChatList）
-        self.seen_rids = deque(maxlen=RID_MEMORY)
-        self.last_msg_at = 0.0
-        self.reopen_at = 0.0     # time.time()，窗口失效后的最早重开时刻
-        self.last_error = ''
+class Cfg:
+    friends = {}          # {wxid: 备注名}
+    poll_interval = 0.5   # 轮询间隔(秒)。用户要求 读取→通知 <5s, 0.5s 留足余量
+    callback_url = ''
+    callback_token = ''
+    callback_timeout = 5
+    callback_retries = 2
 
 
-class WhitelistListener(threading.Thread):
-    '''白名单好友独立窗口消息监听（单线程串行轮询所有窗口）'''
-
-    def __init__(self, friends_cfg: dict, forward_queue: queue.Queue,
-                 poll_interval: float = 1.5):
-        super().__init__(daemon=True, name='wx-listener')
-        self.poll_interval = max(0.5, float(poll_interval or 1.5))
-        self.forward_queue = forward_queue
-        self.states = [_FriendState(wxid, name)
-                       for wxid, name in (friends_cfg or {}).items()
-                       if name]
-        self.started_at = time.time()
-        missing = [wxid for wxid, name in (friends_cfg or {}).items() if not name]
-        if missing:
-            logger.warning('listener.friends 中以下好友的备注名为空，已跳过监听: %s', missing)
-
-    # ---------------- 主循环 ----------------
-    def run(self):
-        if not self.states:
-            logger.warning('listener.friends 为空，监听线程直接退出（请检查 wx_sender_config.json）')
-            return
-        try:
-            # 防息屏（SetThreadExecutionState，线程级）：部署机长期运行必须保持屏幕常亮
-            SystemSettings.open_listening_mode(volume=False)
-        except Exception as e:
-            logger.warning('防息屏设置失败（不影响监听，但请关闭系统息屏/休眠）: %s', e)
-
-        logger.info('白名单监听已启动: %d 个好友, 轮询间隔 %.1fs',
-                    len(self.states), self.poll_interval)
-        self._open_all()
-        while True:
-            for st in self.states:
-                try:
-                    self._poll_friend(st)
-                except Exception as e:
-                    # 单个好友异常不影响其他窗口；UIA 异常通常是窗口失效
-                    self._mark_broken(st, f'{type(e).__name__}: {e}')
-            time.sleep(self.poll_interval)
-
-    # ---------------- 开窗 ----------------
-    def _open_all(self):
-        for st in self.states:
-            self._open_one(st)
-
-    def _open_one(self, st: _FriendState):
-        '''打开（或重开）独立聊天窗口并建立 runtime_id 基准。
-
-        历史/基准消息只记 seen_rids 不转发。开窗与置底有键鼠操作，持 UIA_LOCK。
-        '''
-        try:
-            with UIA_LOCK:
-                window = Navigator.open_seperate_dialog_window(
-                    friend=st.name, is_maximize=False,
-                    window_minimize=True, close_weixin=False)
-                chatList = window.child_window(**Lists.FriendChatList)
-                Tools.activate_chatList(chatList)  # 滚到底部（键鼠）
-                items = chatList.children(control_type='ListItem')
-            st.window = window
-            st.chatList = chatList
-            st.seen_rids.clear()
-            # 当前尾部消息全部记为已见：重开窗口不能把历史消息当新消息转发
-            for item in items[-TAIL_SCAN:]:
-                st.seen_rids.append(item.element_info.runtime_id)
-            st.last_error = ''
-            logger.info('监听窗口已就绪 → %s (%s)，基准消息 %d 条',
-                        st.name, st.wxid, min(len(items), TAIL_SCAN))
-        except Exception as e:
-            self._mark_broken(st, f'开窗失败 {type(e).__name__}: {e}')
-
-    def _mark_broken(self, st: _FriendState, reason: str):
-        st.window = None
-        st.chatList = None
-        st.reopen_at = time.time() + REOPEN_COOLDOWN
-        st.last_error = reason
-        logger.error('监听窗口失效 → %s (%s) | %s | %ds 后重开',
-                     st.name, st.wxid, reason, REOPEN_COOLDOWN)
-
-    # ---------------- 轮询 ----------------
-    def _poll_friend(self, st: _FriendState):
-        if st.window is None:
-            if time.time() >= st.reopen_at:
-                self._open_one(st)
-            return
-
-        with UIA_LOCK:
-            items = st.chatList.children(control_type='ListItem')
-        if not items:
-            return
-
-        # 尾部 TAIL_SCAN 个 item 逐个比对 runtime_id，未见过即新消息
-        for item in items[-TAIL_SCAN:]:
-            rid = item.element_info.runtime_id
-            if rid in st.seen_rids:
-                continue
-            st.seen_rids.append(rid)
-            # 只转发文本消息；时间戳/系统消息(ChatItemView)/图片文件等忽略
-            if item.class_name() != TEXT_ITEM_CLASS:
-                continue
-            text = (item.window_text() or '').strip()
-            if not text:
-                continue
-            if is_recently_sent(st.wxid, text):
-                continue  # 本服务刚发出的回复，过滤自回环
-            st.last_msg_at = time.time()
-            self._enqueue(ForwardMsg(st.wxid, st.name, text, int(time.time() * 1000)))
-
-    def _enqueue(self, msg: ForwardMsg):
-        try:
-            self.forward_queue.put_nowait(msg)
-            preview = msg.text[:50].replace('\n', ' ')
-            logger.info('新消息 → %s (%s): %s%s',
-                        msg.name, msg.wxid, preview, '…' if len(msg.text) > 50 else '')
-        except queue.Full:
-            logger.error('转发队列已满，丢弃消息 ← %s: %s', msg.name, msg.text[:50])
-
-    # ---------------- 状态 ----------------
-    def status(self) -> dict:
-        return {
-            'running': self.is_alive(),
-            'poll_interval': self.poll_interval,
-            'friends': {
-                st.wxid: {
-                    'name': st.name,
-                    'window_ok': st.window is not None,
-                    'last_msg_at': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(st.last_msg_at))
-                    if st.last_msg_at else '',
-                    'last_error': st.last_error,
-                } for st in self.states
-            },
-        }
-
-
-class CallbackWorker(threading.Thread):
-    '''把转发队列中的消息以 StarBot 兼容格式 POST 到 coinMarker 回调端点'''
-
-    def __init__(self, callback_cfg: dict, robot_wxid: str, forward_queue: queue.Queue):
-        super().__init__(daemon=True, name='wx-callback')
-        self.url = callback_cfg.get('url', '')
-        self.token = callback_cfg.get('token', '')
-        self.robot_wxid = robot_wxid or ''
-        self.timeout = callback_cfg.get('timeout', 5)
-        self.max_retries = callback_cfg.get('max_retries', 3)
-        self.forward_queue = forward_queue
-        self.forwarded_total = 0
-        self.dropped_total = 0
-        self.last_forward_at = ''
-        self.last_error = ''
-
-    # ---------------- 主循环 ----------------
-    def run(self):
-        if not self.url:
-            logger.warning('callback.url 为空，回调转发线程退出（仅监听不转发）')
-            return
-        self._send_login_event()
-        logger.info('回调转发已启动 → %s', self.url)
-        while True:
-            msg = self.forward_queue.get()
-            try:
-                self._post_message(msg)
-            finally:
-                self.forward_queue.task_done()
-
-    # ---------------- 事件构造 ----------------
-    def _post_message(self, msg: ForwardMsg):
-        payload = {
-            'event': '10002',
-            'description': '私聊消息事件',
-            'time': msg.ts_ms,
-            'robotId': self.robot_wxid,
-            'data': {
-                'robotId': self.robot_wxid,
-                'fromType': 'private',
-                'fromWxId': msg.wxid,
-                'fromNickName': msg.name,
-                'message': msg.text,
-                'timeStamp': msg.ts_ms,
-                'messageId': msg.msg_id,
-                'messageType': 1,
-                'messageSource': 0,
-                'toWxId': self.robot_wxid,
-                'isPc': 1,
-            },
-        }
-        if self._post_json(payload, what=f'消息 ← {msg.name}'):
-            self.forwarded_total += 1
-
-    def _send_login_event(self):
-        '''启动时发送 event=10001，coinMarker 侧自动注册机器人 session。
-
-        失败仅告警不阻塞：命令回复走 15000 发送 API 与 session 无关，
-        session 可由 coinMarker 侧 PYWX_ROBOT_WXID 环境变量兜底注册。
-        '''
-        payload = {
-            'event': '10001',
-            'description': '微信登录成功',
-            'time': int(time.time() * 1000),
-            'robotId': self.robot_wxid,
-            'data': {'robotId': self.robot_wxid, 'nickname': self.robot_wxid},
-        }
-        ok = self._post_json(payload, what='登录事件', retries=3, backoff=10)
-        if not ok:
-            logger.warning('登录事件发送失败（不影响消息转发，coinMarker 侧可用 PYWX_ROBOT_WXID 兜底）')
-
-    # ---------------- HTTP ----------------
-    def _post_json(self, payload: dict, what: str, retries: int = None, backoff: int = None) -> bool:
-        '''POST JSON 到回调端点。连接错误/超时/5xx 按退避重试，4xx 不重试。
-
-        at-least-once 语义：coinMarker 侧 SaveAlert 的 Redis field 确定性
-        （幂等覆盖），重复投递安全；重试耗尽后丢弃并记日志。
-        '''
-        body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-        attempts = self.max_retries if retries is None else retries
-        delays = [backoff] * attempts if backoff else RETRY_BACKOFF
-        for i in range(attempts + 1):
-            try:
-                req = urllib.request.Request(
-                    self.url, data=body, method='POST',
-                    headers={'Content-Type': 'application/json; charset=utf-8',
-                             'Authorization': self.token})
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    if 200 <= resp.status < 300:
-                        self.last_forward_at = time.strftime('%Y-%m-%d %H:%M:%S')
-                        self.last_error = ''
-                        return True
-                    err = f'HTTP {resp.status}'
-            except urllib.error.HTTPError as e:
-                err = f'HTTP {e.code}'
-                if 400 <= e.code < 500:
-                    break  # 4xx（如 token 错误）重试无意义
-            except Exception as e:
-                err = f'{type(e).__name__}: {e}'
-
-            if i < attempts:
-                delay = delays[min(i, len(delays) - 1)]
-                logger.warning('%s 发送失败(%s)，%ds 后重试(%d/%d)',
-                               what, err, delay, i + 1, attempts)
-                time.sleep(delay)
-
-        self.dropped_total += 1
-        self.last_error = err
-        logger.error('%s 发送最终失败，已丢弃 | %s', what, err)
+def load_config() -> bool:
+    '''读取 listener/callback 配置块; 返回是否可启动。'''
+    try:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as e:
+        logger.error('读取配置失败: %s', e)
         return False
+    listener = cfg.get('listener') or {}
+    callback = cfg.get('callback') or {}
+    Cfg.friends = listener.get('friends') or {}
+    Cfg.poll_interval = float(listener.get('poll_interval', 0.5))
+    Cfg.callback_url = callback.get('url', '')
+    Cfg.callback_token = callback.get('token', '')
+    Cfg.callback_timeout = int(callback.get('timeout', 5))
+    Cfg.callback_retries = int(callback.get('max_retries', 2))
+    if not Cfg.friends:
+        logger.error('配置缺少 listener.friends(白名单 wxid→备注名), 退出')
+        return False
+    if not Cfg.callback_url or not Cfg.callback_token:
+        logger.error('配置缺少 callback.url / callback.token, 退出')
+        return False
+    if not listener.get('enabled', True):
+        logger.info('listener.enabled=false, 不启动监听')
+        return False
+    return True
 
-    # ---------------- 状态 ----------------
-    def status(self) -> dict:
-        return {
-            'url': self.url,
-            'robot_wxid': self.robot_wxid,
-            'forward_queue_size': self.forward_queue.qsize(),
-            'forwarded_total': self.forwarded_total,
-            'dropped_total': self.dropped_total,
-            'last_forward_at': self.last_forward_at,
-            'last_error': self.last_error,
-        }
+
+# ============================================================
+# 回调上报
+# ============================================================
+
+def post_event(payload: dict) -> bool:
+    '''POST 事件到 coinMarker 回调接口, 带重试。网络错误/非2xx 返回 False。'''
+    body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    headers = {'Content-Type': 'application/json; charset=utf-8',
+               'Authorization': 'Bearer ' + Cfg.callback_token}
+    for attempt in range(1 + Cfg.callback_retries):
+        req = urllib.request.Request(Cfg.callback_url, data=body, headers=headers, method='POST')
+        try:
+            with urllib.request.urlopen(req, timeout=Cfg.callback_timeout) as resp:
+                if 200 <= resp.status < 300:
+                    return True
+                logger.warning('回调非 2xx: %s', resp.status)
+        except Exception as e:
+            logger.warning('回调失败(第 %d 次): %s', attempt + 1, e)
+        if attempt < Cfg.callback_retries:
+            time.sleep(1)
+    return False
 
 
-def detect_robot_wxid(callback_cfg: dict) -> str:
-    '''回调配置的 robot_wxid 优先，为空则从微信数据目录探测当前登录 wxid。
+def build_private_message(robot_wxid: str, wxid: str, remark: str, text: str) -> dict:
+    ts_ms = int(time.time() * 1000)
+    digest = hashlib.md5(f'{wxid}|{text}'.encode('utf-8')).hexdigest()[:8]
+    return {
+        'event': '10002',
+        'description': '私聊消息事件',
+        'time': ts_ms,
+        'robotId': robot_wxid,
+        'data': {
+            'robotId': robot_wxid,
+            'fromType': 'private',
+            'fromWxId': wxid,
+            'fromNickName': remark,
+            'message': text,
+            'timeStamp': ts_ms,
+            'messageId': f'{robot_wxid}-{ts_ms}-{digest}',
+            'messageType': 1,
+            'messageSource': 0,
+            'toWxId': robot_wxid,
+            'isPc': 1,
+        },
+    }
 
-    纯文件系统操作（不涉及 UIA），探测失败返回空串由调用方告警。
+
+def post_login(robot_wxid: str, nickname: str = '') -> None:
+    ts_ms = int(time.time() * 1000)
+    payload = {
+        'event': '10001',
+        'description': '登录成功',
+        'time': ts_ms,
+        'robotId': robot_wxid,
+        'data': {'robotId': robot_wxid, 'nickname': nickname},
+    }
+    if post_event(payload):
+        logger.info('已上报 10001 登录事件 robotId=%s', robot_wxid)
+
+
+# ============================================================
+# robot_wxid 探测
+# ============================================================
+
+def detect_robot_wxid(timeout: float = 120) -> str:
+    '''轮询 Tools.get_current_wxid() 直到拿到 wxid(微信登录后才可见)。'''
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            wxid = Tools.get_current_wxid()
+            if wxid:
+                return wxid
+        except Exception as e:
+            logger.warning('get_current_wxid 异常: %s', e)
+        logger.info('尚未探测到登录 wxid(微信未登录?), 10s 后重试...')
+        time.sleep(10)
+    return ''
+
+
+# ============================================================
+# 单好友监听线程
+# ============================================================
+
+def listen_friend(wxid: str, remark: str, robot_wxid_holder: dict) -> None:
     '''
-    wxid = str(callback_cfg.get('robot_wxid', '') or '').strip()
-    if wxid:
-        return wxid
+    打开该好友独立聊天小窗(最小化)并持续轮询:
+    最后一条 ListItem 的 runtime_id 变化 = 新消息。
+    窗口丢失/微信重启时自动重开; 重开后 robot_wxid 若变化则重发 10001。
+    '''
+    backoff = 5
+    while True:
+        try:
+            dw = Navigator.open_seperate_dialog_window(friend=remark, window_minimize=True)
+            chatList = dw.child_window(**LISTS.FriendChatList)
+
+            # 等待消息列表就绪(刚打开窗口 UIA 树需要一点时间)
+            initial_rid = None
+            for _ in range(20):
+                items = chatList.children(control_type='ListItem')
+                if items:
+                    initial_rid = items[-1].element_info.runtime_id
+                    break
+                time.sleep(0.5)
+            if initial_rid is None:
+                raise RuntimeError('消息列表 10s 内无 ListItem')
+
+            logger.info('[%s] 监听就绪 (wxid=%s)', remark, wxid)
+            backoff = 5
+
+            # 换号重连后刷新会话注册
+            robot_now = _safe_get_wxid()
+            if robot_now and robot_now != robot_wxid_holder.get('wxid'):
+                robot_wxid_holder['wxid'] = robot_now
+                logger.info('robot_wxid 变化: %s → %s, 重发 10001',
+                            robot_wxid_holder.get('wxid'), robot_now)
+                post_login(robot_now)
+
+            while True:
+                items = chatList.children(control_type='ListItem')
+                if items:
+                    last = items[-1]
+                    rid = last.element_info.runtime_id
+                    if rid != initial_rid:
+                        initial_rid = rid
+                        _handle_new_item(robot_wxid_holder.get('wxid', ''),
+                                         wxid, remark, last)
+                time.sleep(Cfg.poll_interval)
+
+        except Exception as e:
+            logger.warning('[%s] 监听中断: %s, %ds 后重开窗口', remark, e, backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+
+def _safe_get_wxid() -> str:
     try:
         return Tools.get_current_wxid()
-    except Exception as e:
-        logger.warning('get_current_wxid 探测失败（非 wxid_ 前缀账号或未登录?）: %s', e)
+    except Exception:
         return ''
+
+
+def _handle_new_item(robot_wxid: str, wxid: str, remark: str, item) -> None:
+    '''处理检测到的新消息气泡: 只认文本, 过滤自家回声, 组装 10002 上报。'''
+    try:
+        cls = item.class_name()
+        text = item.window_text()
+    except Exception as e:
+        logger.warning('[%s] 读取消息项失败: %s', remark, e)
+        return
+    if cls != 'mmui::ChatTextItemView':  # 仅文本消息(链接/图片/文件无对应事件)
+        logger.info('[%s] 非文本消息(%s), 忽略', remark, cls)
+        return
+    if not text:
+        return
+    if is_recent_sent_echo(wxid, text):
+        logger.info('[%s] 自家回声, 忽略: %.30s', remark, text)
+        return
+    logger.info('[%s] 新消息: %.50s', remark, text)
+    payload = build_private_message(robot_wxid, wxid, remark, text)
+    if not post_event(payload):
+        logger.error('[%s] 10002 上报失败(已重试): %.50s', remark, text)
+
+
+# ============================================================
+# 入口
+# ============================================================
+
+def main() -> None:
+    if not load_config():
+        sys.exit(1)
+
+    # 防息屏(UIA 常驻依赖微信窗口树, 息屏/锁屏后不可靠)
+    try:
+        from pyweixin.WinSettings import SystemSettings
+        SystemSettings.open_listening_mode(volume=False)
+        logger.info('已开启防息屏模式')
+    except Exception as e:
+        logger.warning('防息屏设置失败(不影响启动): %s', e)
+
+    robot_wxid = detect_robot_wxid()
+    if robot_wxid:
+        logger.info('robot_wxid = %s', robot_wxid)
+        post_login(robot_wxid)
+    else:
+        logger.warning('120s 内未探测到 wxid, 先启动监听, 稍后窗口重连时补发 10001')
+    holder = {'wxid': robot_wxid}
+
+    for wxid, remark in Cfg.friends.items():
+        t = threading.Thread(target=listen_friend, args=(wxid, remark, holder),
+                             name=f'listen-{remark}', daemon=True)
+        t.start()
+        time.sleep(3)  # 逐个开窗, 避免搜索框操作相互踩踏
+        logger.info('监听线程已启动: %s → %s', wxid, remark)
+
+    logger.info('wx_listener 启动完成, 共 %d 个好友, poll=%.1fs, callback=%s',
+                len(Cfg.friends), Cfg.poll_interval, Cfg.callback_url)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        logger.info('收到 Ctrl+C, 退出(小窗保留, 不动微信)')
+
+
+if __name__ == '__main__':
+    main()

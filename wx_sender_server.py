@@ -1,28 +1,23 @@
 '''
-wx_sender_server.py —— 个人微信收发服务（发送 + 白名单监听回调）
+wx_sender_server.py —— 个人微信快讯发送服务
 ================================================
 
-发送链路（替代已停用的 15000 端口 huizai 个人微信机器人 API）:
-    coinMarker(远程服务器 91.98.134.93)
+替代已停用的 15000 端口 huizai 个人微信机器人 API（家庭端服务停用导致
+coinMarker 的 JSSZ 急速上涨/KXZJ 快讯总结推送断链）。
+
+链路: coinMarker(远程服务器 91.98.134.93)
         → POST http://127.0.0.1:15000/api/{robotWxId}/send_text
-        → frpc 隧道 "wx" (frpc-wx.toml, 本地15000→远程15000)
+        → frpc 隧道 "wx" (frpc.toml, 本地15000→远程15000)
         → 本服务(队列) → pyweixin UIA → 微信客户端发送
 
-收消息链路（替代已停用的 StarBot 回调通道，listener.enabled=true 时开启）:
-    微信客户端（白名单好友独立聊天窗口）
-        → WhitelistListener（runtime_id 增量轮询，见 wx_listener.py）
-        → CallbackWorker → POST {callback.url}（StarBot 兼容 event="10002"）
-        → coinMarker 91.98.134.93:19600 /wcf/callback
-
-收发两侧的 UIA 操作通过 wx_common.UIA_LOCK 全局互斥（微信 UIA 单线程）。
-
-发送 API（coinMarker 服务器端零改动）:
+兼容旧 API（coinMarker/SendWxMsg/SendWxMsg_huizai.go 默认 127.0.0.1:15000，
+服务器端零改动）:
     POST /api/{robotWxId}/send_text
     body: {"to_wxid": "48123779466@chatroom", "content": "消息内容"}
     可选: {"at_all": true}  覆盖配置文件中该目标的 at_all 设置
 
 管理/调试接口:
-    GET  /health      队列与 worker 运行状态（listener.enabled 时含监听/回调状态）
+    GET  /health      队列与 worker 运行状态
     GET  /targets     当前 wxid→群名 映射（脱敏）
     POST /send        按群名直接发送（本地测试用） body: {"name","content","at_all"}
 
@@ -30,12 +25,10 @@ wx_sender_server.py —— 个人微信收发服务（发送 + 白名单监听�
     1. NVDA 便携版静默运行（激活微信 UIA，见 memory: wechat-nvda-activation）
     2. 微信已登录且保持运行
     3. 发送期间不要人工操作键鼠（pyautogui 会接管输入）
-    4. 监听模式下白名单好友的独立聊天窗口不要人工关闭（被关后 60s 自动重开）
 
 映射配置: 同目录 wx_sender_config.json（首次运行自动生成模板）
     targets 内 name 留空的 wxid 会被拒绝发送并记日志，填好后无需重启
     （每条消息发送前重新读取配置）。
-    listener.friends 为白名单好友 wxid→备注名映射（备注名必须完整精确）。
 '''
 
 import json
@@ -51,11 +44,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from pyweixin import Messages  # noqa: E402
+from pyweixin import Messages, Navigator  # noqa: E402
 from pyweixin.Config import GlobalConfig  # noqa: E402
-
-from wx_common import UIA_LOCK, record_sent_intent, drop_sent_intent  # noqa: E402
-from wx_listener import WhitelistListener, CallbackWorker, detect_robot_wxid  # noqa: E402
+import wx_common  # noqa: E402  发送回声记录(与 wx_listener 共享)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, 'wx_sender_config.json')
@@ -80,9 +71,7 @@ except Exception:
     pass
 
 # ---------------- 默认配置模板 ----------------
-# wxid 常量来自 coinMarker/SendWxMsg/SendWxMsg_huizai.go 与 starbot 白名单(main.go)
-# 群聊条目按需增删；VolumeBreakout 群推送需把服务器 PYWX_VOLUME_BREAKOUT_GROUP_ID
-# 对应的 @chatroom id 加入 targets 并填群显示名。
+# wxid 常量来自 coinMarker/SendWxMsg/SendWxMsg_huizai.go
 DEFAULT_CONFIG = {
     'listen_host': '127.0.0.1',
     'listen_port': 15000,
@@ -90,6 +79,7 @@ DEFAULT_CONFIG = {
     'send_interval': [3, 6],  # 每条消息发送后的随机延迟秒数（模仿 Go 端 RandomDelay(3,6)）
     'fail_cooldown': 60,     # 连续失败 fail_threshold 次后的冷却秒数
     'fail_threshold': 5,
+    'voice_cooldown': 300,   # 同一目标语音通话冷却秒数（防提醒连发时夺命连环call）
     'targets': {
         '48123779466@chatroom': {'name': '', 'at_all': True,  'desc': 'JSSZ 急速上涨'},
         '43846025020@chatroom': {'name': '', 'at_all': False, 'desc': 'KXZJ 快讯总结'},
@@ -99,27 +89,7 @@ DEFAULT_CONFIG = {
         '50587746113@chatroom': {'name': '', 'at_all': False, 'desc': 'Twitter 推特监控'},
         '18743464752@chatroom': {'name': '', 'at_all': False, 'desc': 'Aming 推特监控'},
         '49568875761@chatroom': {'name': '', 'at_all': False, 'desc': 'FLJXGJH 封狼居胥冠军侯'},
-        'wxid_xerhivsxr9u6':    {'name': '', 'at_all': False, 'desc': 'Xiaokang 私聊（白名单）'},
-        'litiantianss':         {'name': '', 'at_all': False, 'desc': '甜小米 私聊（白名单）'},
-        'wxid_ahdz8pwq9dk312':  {'name': '', 'at_all': False, 'desc': 'Michelle 私聊（白名单）'},
-    },
-    # ---- 收消息监听 + 回调转发（替代 StarBot 回调通道）----
-    'listener': {
-        'enabled': False,     # 填好 friends 的备注名后再改为 true
-        'poll_interval': 1.5, # 独立窗口轮询间隔（秒）
-        # 白名单好友 wxid → 微信内显示/备注名（必须完整精确，搜索定位用）
-        'friends': {
-            'wxid_xerhivsxr9u622': '',
-            'litiantianss': '',
-            'wxid_ahdz8pwq9dk312': '',
-        },
-    },
-    'callback': {
-        'url': 'http://91.98.134.93:19600/wcf/callback',
-        'token': '',          # 与服务器 PYWX_CALLBACK_TOKEN 一致（Authorization 裸 token）
-        'robot_wxid': '',     # 本机登录微信的 wxid，留空自动探测（非 wxid_ 前缀账号须手填）
-        'timeout': 5,
-        'max_retries': 3,
+        'wxid_xerhivsxr9u6':    {'name': '', 'at_all': False, 'desc': 'Xiaokang 私聊'},
     },
 }
 
@@ -150,35 +120,44 @@ class SendWorker(threading.Thread):
         self.last_error = ''
         self.last_sent_at = ''
         self.consecutive_fails = 0
+        self.voice_calls = 0        # 成功拨打的语音通话数
+        self.voice_skipped = 0      # 冷却内被跳过的拨号数
+        self.last_voice_at = {}     # to_wxid -> 上次成功拨号时间戳
+
+    def voice_cooldown_left(self, to_wxid: str) -> int:
+        '''返回该目标语音冷却剩余秒数（0=可拨）'''
+        cooldown = load_config().get('voice_cooldown', 300)
+        elapsed = time.time() - self.last_voice_at.get(to_wxid, 0)
+        return max(0, int(cooldown - elapsed))
 
     def run(self):
-        logger.info('发送 worker 已启动（单线程串行，与监听共享 UIA_LOCK）')
+        logger.info('发送 worker 已启动（单线程串行）')
         while True:
             job = self.send_queue.get()
-            sent_wxid = job.get('wxid', 'direct')
             try:
-                # 先登记后发送：监听窗口会看到自己发出的消息，据此过滤自回环
-                record_sent_intent(sent_wxid, job['content'])
-                try:
-                    with UIA_LOCK:  # 与 WhitelistListener 的 UIA 读操作互斥
-                        Messages.send_messages_to_friend(
-                            friend=job['name'],
-                            messages=[job['content']],
-                            at_all=job['at_all'],
-                        )
-                except Exception:
-                    drop_sent_intent(sent_wxid, job['content'])  # 未发出，撤销登记
-                    raise
-                self.sent_total += 1
-                self.consecutive_fails = 0
-                self.last_sent_at = time.strftime('%Y-%m-%d %H:%M:%S')
-                preview = job['content'][:50].replace('\n', ' ')
-                logger.info('已发送 → %s: %s%s', job['name'], preview, '…' if len(job['content']) > 50 else '')
+                if job.get('kind') == 'voice':
+                    # 双重冷却检查：入队时已查过，排队期间可能已拨过（防连拨）
+                    left = self.voice_cooldown_left(job['to'])
+                    if left > 0:
+                        self.voice_skipped += 1
+                        logger.info('语音冷却中(%ds) → %s，跳过', left, job['name'])
+                    else:
+                        # 不用 pyweixin 的 Call.voice_call：其按钮选择器写死
+                        # title='语音聊天'，在微信 4.1.2.17 已改为「语音通话」。
+                        # auto_id='voip_button' 跨版本更稳（diag_voice2.py 探明）。
+                        main_window = Navigator.open_dialog_window(friend=job['name'])
+                        main_window.child_window(control_type='Button',
+                                                 auto_id='voip_button').click_input()
+                        self.voice_calls += 1
+                        self.last_voice_at[job['to']] = time.time()
+                        logger.info('已拨打语音 → %s', job['name'])
+                else:
+                    self._send_text(job)
             except Exception as e:
                 self.failed_total += 1
                 self.consecutive_fails += 1
                 self.last_error = f'{type(e).__name__}: {e}'
-                logger.error('发送失败(%d 连败) → %s | %s', self.consecutive_fails, job['name'], self.last_error)
+                logger.error('任务失败(%d 连败) → %s | %s', self.consecutive_fails, job['name'], self.last_error)
             finally:
                 self.send_queue.task_done()
                 interval = load_config().get('send_interval', [3, 6])
@@ -191,12 +170,28 @@ class SendWorker(threading.Thread):
                     time.sleep(cfg.get('fail_cooldown', 60))
                     self.consecutive_fails = 0
 
+    def _send_text(self, job):
+        Messages.send_messages_to_friend(
+            friend=job['name'],
+            messages=[job['content']],
+            at_all=job['at_all'],
+        )
+        self.sent_total += 1
+        self.consecutive_fails = 0
+        self.last_sent_at = time.strftime('%Y-%m-%d %H:%M:%S')
+        preview = job['content'][:50].replace('\n', ' ')
+        logger.info('已发送 → %s: %s%s', job['name'], preview, '…' if len(job['content']) > 50 else '')
+        # 记录发送回声(wx_listener 据此跳过自家消息, 避免收发死循环)
+        if job.get('to'):
+            try:
+                wx_common.log_sent(job['to'], job['content'])
+            except Exception as e:
+                logger.warning('回声记录失败(不影响发送): %s', e)
+
 
 # ---------------- HTTP 服务 ----------------
 send_queue: queue.Queue = None  # type: ignore
 worker: SendWorker = None  # type: ignore
-listener: WhitelistListener = None  # type: ignore
-callback_worker: CallbackWorker = None  # type: ignore
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -224,25 +219,20 @@ class Handler(BaseHTTPRequestHandler):
     # ---- GET ----
     def do_GET(self):
         if self.path == '/health':
-            cfg = load_config()
-            configured = sum(1 for t in cfg['targets'].values() if t.get('name'))
-            payload = {
+            configured = sum(1 for t in load_config()['targets'].values() if t.get('name'))
+            self._json(200, {
                 'status': 'ok' if worker and worker.is_alive() else 'degraded',
                 'queue_size': send_queue.qsize(),
-                'queue_max': cfg.get('queue_max', 200),
+                'queue_max': load_config().get('queue_max', 200),
                 'sent_total': worker.sent_total,
                 'failed_total': worker.failed_total,
                 'dropped_total': worker.dropped_total,
                 'last_sent_at': worker.last_sent_at,
                 'last_error': worker.last_error,
-                'targets_configured': f'{configured}/{len(cfg["targets"])}',
-                'listener_enabled': bool((cfg.get('listener') or {}).get('enabled')),
-            }
-            if listener is not None:
-                payload['listener_status'] = listener.status()
-            if callback_worker is not None:
-                payload['callback_status'] = callback_worker.status()
-            self._json(200, payload)
+                'voice_calls': worker.voice_calls,
+                'voice_skipped': worker.voice_skipped,
+                'targets_configured': f'{configured}/{len(load_config()["targets"])}',
+            })
         elif self.path == '/targets':
             targets = {wxid: {'name': t.get('name', ''), 'desc': t.get('desc', ''),
                               'at_all': t.get('at_all', False)}
@@ -275,7 +265,28 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(404, {'error': f'target {to_wxid} not configured name'})
                 return
             at_all = bool(at_all_override) if at_all_override is not None else bool(target.get('at_all'))
-            self._enqueue({'name': name, 'content': content, 'at_all': at_all}, to_wxid)
+            self._enqueue({'name': name, 'content': content, 'at_all': at_all, 'to': to_wxid}, to_wxid)
+        # 语音通话: /api/{robotWxId}/voice_call —— 强提醒通道（价格到点打电话）
+        # body: {"to_wxid": "..."}；与文本共用队列串行（键鼠互斥），同目标冷却 voice_cooldown
+        elif self.path.startswith('/api/') and self.path.endswith('/voice_call'):
+            body = self._read_body()
+            to_wxid = str(body.get('to_wxid', '')).strip()
+            if not to_wxid:
+                self._json(400, {'error': 'to_wxid 不能为空'})
+                return
+            target = load_config()['targets'].get(to_wxid)
+            if not target or not target.get('name', ''):
+                worker.dropped_total += 1
+                logger.warning('语音目标未配置: %s，已丢弃', to_wxid)
+                self._json(404, {'error': f'unknown to_wxid: {to_wxid}'})
+                return
+            left = worker.voice_cooldown_left(to_wxid)
+            if left > 0:
+                worker.voice_skipped += 1
+                logger.info('语音冷却中(%ds) → %s，不入队', left, target['name'])
+                self._json(200, {'code': 0, 'queued': False, 'skipped': 'cooldown', 'retry_after': left})
+                return
+            self._enqueue({'name': target['name'], 'to': to_wxid, 'kind': 'voice'}, to_wxid)
         # 调试接口: /send —— 按群名直接发（本地测试用，不查映射）
         elif self.path == '/send':
             body = self._read_body()
@@ -290,8 +301,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {'error': 'not found'})
 
     def _enqueue(self, job: dict, src: str):
-        # src 即发送目标 wxid（/send 调试路径为 'direct'），供自回环过滤登记用
-        job['wxid'] = src
         try:
             send_queue.put_nowait(job)
             logger.info('入队 ← %s → %s', src, job['name'])
@@ -319,7 +328,7 @@ def check_prerequisites():
 
 
 def main():
-    global send_queue, worker, listener, callback_worker
+    global send_queue, worker
     # 重定向到文件时才切 UTF-8（logging.StreamHandler 默认绑 stderr，两个流都要处理）
     for _stream in (sys.stdout, sys.stderr):
         if _stream and not _stream.isatty() and hasattr(_stream, 'reconfigure'):
@@ -331,26 +340,6 @@ def main():
     send_queue = queue.Queue(maxsize=cfg.get('queue_max', 200))
     worker = SendWorker(send_queue)
     worker.start()
-
-    # ---- 收消息监听 + 回调转发（listener.enabled 时开启）----
-    listener_cfg = cfg.get('listener') or {}
-    if listener_cfg.get('enabled'):
-        callback_cfg = cfg.get('callback') or {}
-        robot_wxid = detect_robot_wxid(callback_cfg)
-        if robot_wxid:
-            logger.info('当前机器人 wxid: %s', robot_wxid)
-        else:
-            logger.warning('robot_wxid 未配置且探测失败，回调事件 robotId 将为空'
-                           '（coinMarker 侧需配 PYWX_ROBOT_WXID 兜底注册 session）')
-        forward_queue = queue.Queue(maxsize=100)
-        listener = WhitelistListener(listener_cfg.get('friends') or {},
-                                     forward_queue,
-                                     poll_interval=listener_cfg.get('poll_interval', 1.5))
-        callback_worker = CallbackWorker(callback_cfg, robot_wxid, forward_queue)
-        listener.start()
-        callback_worker.start()
-    else:
-        logger.info('listener.enabled=false，收消息监听未开启（纯发送模式）')
 
     host, port = cfg.get('listen_host', '127.0.0.1'), cfg.get('listen_port', 15000)
     server = ThreadingHTTPServer((host, port), Handler)

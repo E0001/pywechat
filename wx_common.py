@@ -1,94 +1,72 @@
-'''
-wx_common.py —— 发送服务与消息监听的共享基础设施
-================================================
+# -*- coding: utf-8 -*-
+"""
+wx_common — wx_sender 与 wx_listener 的共享工具。
 
-1. UIA_LOCK: pyweixin 所有 UIA 操作（读 + 键鼠）的全局互斥锁。
-   微信 UIA 是单线程 COM 对象，跨线程并发操作会死锁/串扰，
-   SendWorker（发送）与 WhitelistListener（监听轮询）必须串行使用。
-   锁粒度 = 单次完整 UIA 操作（一次发送 / 一次控件读取），
-   发送后的随机节流延迟在锁外，保持原有节流语义。
+当前仅提供「发送回声记录」：wx_sender 每次发送成功后记录 (to_wxid, content)，
+wx_listener 检测到聊天窗口新消息时先查记录——若该内容刚被本机发给对方，
+即为机器人自己的回声，跳过转发，避免 收到→回复→再收到 的死循环。
 
-2. 自回环过滤: 监听窗口会看到本服务自己发出的消息（item 同样 append），
-   SendWorker 发送【前】登记意图，监听侧据此过滤。
-   先登记后发送可消除 "item append 早于登记" 的竞态窗口。
-'''
+设计取舍（v1）：
+- listener 对 UIA 只读不写（不开窗点击、不输入、不右键），与 wx_sender 的
+  键鼠/开窗操作并发面极小，故不做跨进程 UIA 锁；实测若仍冲突再加。
+- 记录文件按 JSON Lines 追加，单行短小，Windows 下 append 近似原子；
+  读取容忍半行（解析失败即跳过）。文件超上限自动截断，只留最近记录。
 
-import collections
-import re
-import threading
+用法:
+    from wx_common import log_sent, is_recent_sent_echo
+    log_sent('wxid_xxx', '已设置提醒')
+    if is_recent_sent_echo('wxid_xxx', '已设置提醒'):
+        ...  # 自己的回声，忽略
+"""
+import json
+import os
 import time
 
-# 所有 pyweixin 调用（UIA 读 + 键鼠操作）统一持此锁
-UIA_LOCK = threading.RLock()
-
-# 自回环记忆时长（秒）：发送成功后该内容在此窗口内被监听侧忽略
-_ECHO_TTL = 15 * 60
-
-# wxid -> deque[(content, ts)]，按时间升序，超量/超时淘汰
-_echo_map: dict = {}
-_echo_mu = threading.Lock()
-
-# 每个 wxid 最多记忆条数（防长文本命令刷爆内存）
-_ECHO_MAX_PER_WXID = 64
-
-_WS_RE = re.compile(r'\s+')
+_BASE = os.path.dirname(os.path.abspath(__file__))
+ECHO_FILE = os.path.join(_BASE, 'wx_sent_echo.jsonl')
+_KEEP_LINES = 200      # 截断后保留的行数
+_DEFAULT_WINDOW = 60   # 回声判定窗口（秒）：60 秒内发过同样内容视为回声
 
 
-def _normalize(text: str) -> str:
-    '''归一化：去除所有空白字符后比较（监听取到的文本可能带换行/尾随空格）'''
-    return _WS_RE.sub('', text or '')
+def log_sent(to_wxid: str, content: str) -> None:
+    """wx_sender 发送成功后调用，记录一条发送。失败抛异常由调用方处理。"""
+    line = json.dumps({'to': to_wxid, 'content': content, 'ts': time.time()},
+                      ensure_ascii=False)
+    with open(ECHO_FILE, 'a', encoding='utf-8') as f:
+        f.write(line + '\n')
+    _maybe_truncate()
 
 
-def record_sent_intent(wxid: str, content: str):
-    '''SendWorker 发送前登记意图（先登记后发送，消除竞态）。
+def is_recent_sent_echo(to_wxid: str, content: str, window: float = _DEFAULT_WINDOW) -> bool:
+    """判断 (to_wxid, content) 是否在 window 秒内被本机发送过（即自己的回声）。"""
+    if not os.path.exists(ECHO_FILE):
+        return False
+    cutoff = time.time() - window
+    try:
+        with open(ECHO_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except OSError:
+        return False
+    for line in lines[-_KEEP_LINES:]:
+        try:
+            rec = json.loads(line)
+        except (ValueError, json.JSONDecodeError):
+            continue  # 容忍写入竞争产生的半行
+        if rec.get('to') == to_wxid and rec.get('content') == content \
+                and rec.get('ts', 0) >= cutoff:
+            return True
+    return False
 
-    wxid 为 'direct'（/send 调试路径）时不登记——调试消息不参与自回环过滤。
-    '''
-    if not wxid or wxid == 'direct' or not content:
-        return
-    now = time.time()
-    with _echo_mu:
-        dq = _echo_map.setdefault(wxid, collections.deque())
-        dq.append((_normalize(content), now))
-        _evict(dq, now)
 
-
-def drop_sent_intent(wxid: str, content: str):
-    '''发送抛异常时撤销登记（该消息实际未发出，不应被过滤）'''
-    if not wxid or wxid == 'direct' or not content:
-        return
-    key = _normalize(content)
-    if not key:
-        return
-    with _echo_mu:
-        dq = _echo_map.get(wxid)
-        if not dq:
+def _maybe_truncate() -> None:
+    """超过上限时截断，只保留最近 _KEEP_LINES 行。失败静默（不影响发送）。"""
+    try:
+        size = os.path.getsize(ECHO_FILE)
+        if size < 256 * 1024:  # 256KB 以内不处理
             return
-        for item in dq:  # 只删最早一条匹配内容（同名内容多次发送时保留其余）
-            if item[0] == key:
-                dq.remove(item)
-                break
-
-
-def is_recently_sent(wxid: str, content: str) -> bool:
-    '''判断该内容是否为近 _ECHO_TTL 内本服务向该 wxid 发出（需过滤的自回环）'''
-    if not wxid or not content:
-        return False
-    key = _normalize(content)
-    if not key:
-        return False
-    now = time.time()
-    with _echo_mu:
-        dq = _echo_map.get(wxid)
-        if not dq:
-            return False
-        _evict(dq, now)
-        return any(item[0] == key for item in dq)
-
-
-def _evict(dq: collections.deque, now: float):
-    '''淘汰过期与超量条目（调用方需已持有 _echo_mu）'''
-    while dq and now - dq[0][1] > _ECHO_TTL:
-        dq.popleft()
-    while len(dq) > _ECHO_MAX_PER_WXID:
-        dq.popleft()
+        with open(ECHO_FILE, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        with open(ECHO_FILE, 'w', encoding='utf-8') as f:
+            f.writelines(lines[-_KEEP_LINES:])
+    except OSError:
+        pass
