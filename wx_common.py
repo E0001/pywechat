@@ -20,12 +20,34 @@ wx_listener 检测到聊天窗口新消息时先查记录——若该内容刚�
 """
 import json
 import os
+import sys
 import time
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
 ECHO_FILE = os.path.join(_BASE, 'wx_sent_echo.jsonl')
 _KEEP_LINES = 200      # 截断后保留的行数
 _DEFAULT_WINDOW = 60   # 回声判定窗口（秒）：60 秒内发过同样内容视为回声
+
+
+def acquire_instance_lock(name: str) -> None:
+    '''单实例锁：同一脚本只允许一个进程存活，重复启动直接退出。
+
+    背景: 本机 uv venv 的 python.exe 启动任何脚本都会产生成对的两个进程
+    （trampoline 双生，间隔 ~20ms），不加锁会导致消息双发/回调双份。
+    锁文件按脚本名区分（.lock-{name}），进程退出后 OS 自动释放（msvcrt.locking）。
+    '''
+    import msvcrt
+    path = os.path.join(_BASE, f'.lock-{name}')
+    try:
+        f = open(path, 'a+')
+        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        f.seek(0)
+        f.truncate()
+        f.write(f'{os.getpid()}\n')
+        f.flush()
+    except (OSError, IOError):
+        print(f'[wx_common] 已有 {name} 实例在运行，本进程退出', file=sys.stderr)
+        sys.exit(0)
 
 
 def log_sent(to_wxid: str, content: str) -> None:

@@ -329,6 +329,7 @@ def check_prerequisites():
 
 def main():
     global send_queue, worker
+    wx_common.acquire_instance_lock('wx_sender')  # 双生进程第二个在此退出
     # 重定向到文件时才切 UTF-8（logging.StreamHandler 默认绑 stderr，两个流都要处理）
     for _stream in (sys.stdout, sys.stderr):
         if _stream and not _stream.isatty() and hasattr(_stream, 'reconfigure'):

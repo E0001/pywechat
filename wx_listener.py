@@ -48,7 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pyweixin import Navigator, Tools  # noqa: E402
 from pyweixin.Config import GlobalConfig  # noqa: E402
 from pyweixin.Uielements import Lists  # noqa: E402
-from wx_common import is_recent_sent_echo  # noqa: E402
+from wx_common import is_recent_sent_echo, acquire_instance_lock  # noqa: E402
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, 'wx_sender_config.json')
@@ -86,6 +86,9 @@ class Cfg:
     callback_token = ''
     callback_timeout = 5
     callback_retries = 2
+    robot_wxid = ''       # 固定 robot_wxid(配置优先)。文件夹探测正则对带后缀的
+                          # 目录名会截出长短两种变体, 漂移会导致 session 双注册/
+                          # 提醒 BotID 混乱, 故生产必须写死
 
 
 def load_config() -> bool:
@@ -96,6 +99,7 @@ def load_config() -> bool:
     except (OSError, ValueError) as e:
         logger.error('读取配置失败: %s', e)
         return False
+    acquire_instance_lock('wx_listener')  # 双生进程第二个在此退出
     listener = cfg.get('listener') or {}
     callback = cfg.get('callback') or {}
     Cfg.friends = listener.get('friends') or {}
@@ -104,6 +108,7 @@ def load_config() -> bool:
     Cfg.callback_token = callback.get('token', '')
     Cfg.callback_timeout = int(callback.get('timeout', 5))
     Cfg.callback_retries = int(callback.get('max_retries', 2))
+    Cfg.robot_wxid = str(callback.get('robot_wxid', '')).strip()
     if not Cfg.friends:
         logger.error('配置缺少 listener.friends(白名单 wxid→备注名), 退出')
         return False
@@ -225,13 +230,15 @@ def listen_friend(wxid: str, remark: str, robot_wxid_holder: dict) -> None:
             logger.info('[%s] 监听就绪 (wxid=%s)', remark, wxid)
             backoff = 5
 
-            # 换号重连后刷新会话注册
-            robot_now = _safe_get_wxid()
-            if robot_now and robot_now != robot_wxid_holder.get('wxid'):
-                robot_wxid_holder['wxid'] = robot_now
-                logger.info('robot_wxid 变化: %s → %s, 重发 10001',
-                            robot_wxid_holder.get('wxid'), robot_now)
-                post_login(robot_now)
+            # 换号重连后刷新会话注册（robot_wxid 由配置固定时跳过——
+            # 文件夹探测的长短版漂移会被误判为换号，造成 session 双注册）
+            if not Cfg.robot_wxid:
+                robot_now = _safe_get_wxid()
+                if robot_now and robot_now != robot_wxid_holder.get('wxid'):
+                    logger.info('robot_wxid 变化: %s → %s, 重发 10001',
+                                robot_wxid_holder.get('wxid'), robot_now)
+                    robot_wxid_holder['wxid'] = robot_now
+                    post_login(robot_now)
 
             while True:
                 items = chatList.children(control_type='ListItem')
@@ -295,9 +302,11 @@ def main() -> None:
     except Exception as e:
         logger.warning('防息屏设置失败(不影响启动): %s', e)
 
-    robot_wxid = detect_robot_wxid()
+    # robot_wxid 配置优先（防文件夹正则的长短版漂移），未配置才探测
+    robot_wxid = Cfg.robot_wxid or detect_robot_wxid()
     if robot_wxid:
-        logger.info('robot_wxid = %s', robot_wxid)
+        logger.info('robot_wxid = %s%s', robot_wxid,
+                    ' (来自配置)' if Cfg.robot_wxid else ' (自动探测)')
         post_login(robot_wxid)
     else:
         logger.warning('120s 内未探测到 wxid, 先启动监听, 稍后窗口重连时补发 10001')
