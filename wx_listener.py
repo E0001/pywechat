@@ -38,6 +38,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -49,10 +50,10 @@ from pyweixin import Navigator, Tools  # noqa: E402
 from pyweixin.Config import GlobalConfig  # noqa: E402
 from pyweixin.Uielements import Lists  # noqa: E402
 from pyweixin.WeChatTools import Main_window, SideBar  # noqa: E402  实例(非类)
-from wx_common import (acquire_instance_lock, is_recent_inbound,  # noqa: E402
-                       is_recent_sent_echo, log_inbound, search_terms,
-                       set_chat_hwnd, set_contact_name,
-                       wait_wechat_ready)
+from wx_common import (acquire_instance_lock, echo_fingerprints,  # noqa: E402
+                       is_recent_inbound, is_recent_sent_echo, log_inbound,
+                       search_terms, seen_fingerprints, set_chat_hwnd,
+                       set_contact_name, wait_wechat_ready)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, 'wx_sender_config.json')
@@ -282,10 +283,29 @@ def _open_friend_window(wxid: str, remark: str):
     raise last_err or RuntimeError(f'[{remark}] 无可用搜索词')
 
 
+_TAIL = 15  # 轮询比对的尾部消息条数(快照 diff 窗口, 覆盖突发连发)
+
+# ---- 消息条目识别与重试(2026-09-02 连发漏消息修复) ----
+# 实锤(2026-09-02 13:24:36): 连发时前面一条的 ListItem class 是
+# mmui::ChatItemView/ChatBubbleItemView 而非 ChatTextItemView, 被旧白名单
+# 误判"非文本"忽略且 rid 已进 seen → 永久丢失。放宽为「mmui::Chat 系
+# class(排除系统条目) + 非空且非时间样文本」即认文本消息; 暂读不出文本的
+# (渲染早期/树重排竞态)不进 seen, 下轮重读, 超过 _RETRY_MAX 轮放弃。
+_SYS_CLASS = 'mmui::ChatSystemInfoItemView'
+_TIME_TEXT_RE = re.compile(
+    r'^(?:[上下]午\s*)?\d{1,2}:\d{2}(?::\d{2})?$'
+    r'|^星期[一二三四五六日天]$'
+    r'|^\d{4}年\d{1,2}月\d{1,2}日$'
+    r'|^以下为新消息$')
+_RETRY_MAX = 10  # 同一 rid 最多重试轮数(~5s), 防图片类永久空文本死循环
+_retry_counts = {}  # rid -> 已重试轮数(渲染竞态/上报失败共用)
+
+
 def listen_friend(wxid: str, remark: str, robot_wxid_holder: dict) -> None:
     '''
     打开该好友独立聊天小窗(最小化)并持续轮询:
-    最后一条 ListItem 的 runtime_id 变化 = 新消息。
+    尾部消息列表的 runtime_id 快照 diff, 新增 rid 逐条处理
+    (同一轮询周期内连发多条也不漏)。
     窗口丢失/微信重启时自动重开; 重开后 robot_wxid 若变化则重发 10001。
 
     开窗搜索词三级自愈(见 _open_friend_window): 追踪名 → 配置备注名 →
@@ -302,25 +322,33 @@ def listen_friend(wxid: str, remark: str, robot_wxid_holder: dict) -> None:
             chatList = dw.child_window(**LISTS.FriendChatList)
 
             # 等待消息列表就绪且基线稳定。窗口(重)开时列表渐进渲染——旧消息
-            # 逐条补齐, items[-1] 的 rid 会连续变化, 直接取首见 rid 当基线
-            # 会把渲染补齐的历史消息误判为新消息重复转发(一条命令被转 3 次
-            # 的事故根因)。要求 rid 连续 2s 不变才算稳定; 渲染通常 1-3s 完成。
-            initial_rid = None
+            # 逐条补齐, 直接取首见列表当基线会把渲染补齐的历史消息误判为
+            # 新消息重复转发(一条命令被转 3 次的事故根因)。要求尾部 rid 快照
+            # 连续 2s 不变才算稳定; 渲染通常 1-3s 完成。
+            initial_snap = None
             stable_since = None
             deadline = time.time() + 15
             while time.time() < deadline:
                 items = chatList.children(control_type='ListItem')
-                if items:
-                    rid = items[-1].element_info.runtime_id
-                    if rid == initial_rid:
+                snap = tuple(it.element_info.runtime_id for it in items[-_TAIL:])
+                if snap:
+                    if snap == initial_snap:
                         if time.time() - stable_since >= 2.0:
                             break  # 列表已稳定
                     else:
-                        initial_rid = rid
+                        initial_snap = snap
                         stable_since = time.time()
                 time.sleep(0.5)
-            if initial_rid is None or stable_since is None:
+            if not initial_snap:
                 raise RuntimeError('消息列表 15s 内未出现稳定基线')
+            seen = set(initial_snap)
+
+            # 基线 ≠ 已处理: 对账补推中断/重启期间漏掉的消息(见 _reconcile_missed)
+            try:
+                _reconcile_missed(robot_wxid_holder.get('wxid', ''),
+                                  wxid, remark, chatList, seen)
+            except Exception as e:
+                logger.warning('[%s] 对账补推异常(不影响监听): %s', remark, e)
 
             logger.info('[%s] 监听就绪 (wxid=%s, 寻址词=%s)', remark, wxid, term)
             header = _read_header_name(dw)
@@ -343,12 +371,34 @@ def listen_friend(wxid: str, remark: str, robot_wxid_holder: dict) -> None:
             while True:
                 items = chatList.children(control_type='ListItem')
                 if items:
-                    last = items[-1]
-                    rid = last.element_info.runtime_id
-                    if rid != initial_rid:
-                        initial_rid = rid
-                        _handle_new_item(robot_wxid_holder.get('wxid', ''),
-                                         wxid, remark, last)
+                    # 尾部快照 diff: 同一轮询周期内连发多条(0.5s 内 2 条曾
+                    # 只见最后一条, 漏掉前一条)也能逐条按序处理。
+                    tail = items[-_TAIL:]
+                    tail_rids = {it.element_info.runtime_id for it in tail}
+                    fresh = [it for it in tail
+                             if it.element_info.runtime_id not in seen]
+                    for it in fresh:
+                        rid = it.element_info.runtime_id
+                        st = _handle_new_item(robot_wxid_holder.get('wxid', ''),
+                                              wxid, remark, it)
+                        if st == 'ok':
+                            seen.add(rid)
+                            _retry_counts.pop(rid, None)
+                            continue
+                        # retry: rid 不进 seen, 下轮重读文本/重报; 超限放弃
+                        # 防图片类永久空文本死循环(见 _RETRY_MAX 注释)。
+                        n = _retry_counts.get(rid, 0) + 1
+                        if n >= _RETRY_MAX:
+                            logger.warning('[%s] 重试 %d 轮仍失败, 放弃该条',
+                                           remark, n)
+                            seen.add(rid)
+                            _retry_counts.pop(rid, None)
+                        else:
+                            _retry_counts[rid] = n
+                    seen &= tail_rids  # seen 有界: 只保留当前尾部窗口
+                    for rid in list(_retry_counts):
+                        if rid not in tail_rids:
+                            del _retry_counts[rid]
                 poll_count += 1
                 if poll_count % 60 == 0:  # ~30s 刷新一次显示名(改备注自愈的关键)
                     header = _read_header_name(dw)
@@ -371,29 +421,108 @@ def _safe_get_wxid() -> str:
         return ''
 
 
-def _handle_new_item(robot_wxid: str, wxid: str, remark: str, item) -> None:
-    '''处理检测到的新消息气泡: 只认文本, 过滤自家回声, 组装 10002 上报。'''
+def _reconcile_missed(robot_wxid: str, wxid: str, remark: str,
+                      chat_list, seen: set) -> None:
+    '''
+    中断/重启对账兜底(2026-09-02): 基线里查找空窗期间漏转发的消息并补推。
+
+    原基线机制(下方 initial_snap 稳定逻辑)把重开窗口时的全部消息当哑基线
+    跳过——防渲染补齐误报的同时, 也把中断期间到达的消息静默丢弃了(昨晚
+    no active desktop 一整晚的事故)。这里用 48h 落盘指纹定位水位: 从列表
+    尾部往前扫, 第一条命中「已转发 ∪ 自家回声」指纹的消息即水位, 其后
+    (更新)收集到的未见过消息按时间正序补推。中断段内不会有自家回复
+    (收不到命令就无回复), 水位不会截断漏网段; 一条水位都没有(新好友/
+    指纹过期)则保守放弃, 防历史消息整体重放。补推的 rid 计入 seen 防重复。
+    '''
     try:
-        cls = item.class_name()
-        text = item.window_text()
+        items = chat_list.children(control_type='ListItem')
     except Exception as e:
-        logger.warning('[%s] 读取消息项失败: %s', remark, e)
+        logger.warning('[%s] 对账读取列表失败(跳过补推): %s', remark, e)
         return
-    if cls != 'mmui::ChatTextItemView':  # 仅文本消息(链接/图片/文件无对应事件)
-        logger.info('[%s] 非文本消息(%s), 忽略', remark, cls)
+    if not items:
         return
-    if not text:
+    fps = seen_fingerprints(wxid) | echo_fingerprints(wxid)
+    missed = []  # (rid, text), 逆序收集(新→旧)
+    for it in reversed(items):
+        try:
+            cls = it.class_name() or ''
+            text = (it.window_text() or '').strip()
+            rid = it.element_info.runtime_id
+        except Exception:
+            continue  # 读不出的条目既不算漏网也不算水位
+        if text and text in fps:
+            break  # 水位: 此条已处理过, 收集到的 missed 即空窗漏网段
+        if not text or cls == _SYS_CLASS or _TIME_TEXT_RE.match(text):
+            continue  # 系统/时间/空条目: 跳过但继续往前找水位
+        missed.append((rid, text))
+    if not missed:
         return
+    if not fps:
+        logger.warning('[%s] 无历史指纹(新会话或指纹过期), 保守放弃补推 %d 条',
+                       remark, len(missed))
+        return
+    missed.reverse()  # 时间正序(旧→新)补推
+    logger.info('[%s] 对账: 补推中断期间漏掉的 %d 条消息', remark, len(missed))
+    for rid, text in missed:
+        seen.add(rid)
+        if is_recent_sent_echo(wxid, text):  # echo 48h 指纹外的双保险
+            logger.info('[%s] 补推跳过自家回声: %.30s', remark, text)
+            continue
+        payload = build_private_message(robot_wxid, wxid, remark, text)
+        if post_event(payload):
+            try:
+                log_inbound(wxid, text)
+            except OSError:
+                pass
+            logger.info('[%s] 补推成功: %.50s', remark, text)
+        else:
+            logger.error('[%s] 补推上报失败(不重试, 防重复): %.50s', remark, text)
+
+
+def _classify_item(item, remark: str):
+    '''
+    读消息条目, 返回 (状态, 文本):
+      'ok'    —— 文本消息, 文本在返回值里
+      'skip'  —— 确定忽略(系统条目/时间条目/非 Chat 系 class)
+      'retry' —— 疑似文本但暂读不出(渲染早期/树重排竞态), 应下轮重读
+    class 白名单见上方 _TIME_TEXT_RE 处注释(ChatItemView/ChatBubbleItemView
+    实锤漏消息)。
+    '''
+    try:
+        cls = item.class_name() or ''
+        text = (item.window_text() or '').strip()
+    except Exception:
+        return 'retry', ''  # COM 引用失效/树重排中, 下轮 children() 重建引用后重读
+    if cls == _SYS_CLASS:
+        return 'skip', ''
+    if cls.startswith('mmui::Chat'):
+        if not text:
+            return 'retry', ''
+        if _TIME_TEXT_RE.match(text):
+            return 'skip', ''
+        return 'ok', text
+    return 'skip', ''
+
+
+def _handle_new_item(robot_wxid: str, wxid: str, remark: str, item) -> str:
+    '''
+    处理检测到的新消息气泡, 返回处理结果供调用方决定 seen 归集:
+      'ok'    —— 已转发成功或明确忽略, rid 可计入 seen
+      'retry' —— 暂时处理不了(读不出文本/上报失败), rid 不进 seen 下轮重试
+    '''
+    status, text = _classify_item(item, remark)
+    if status != 'ok':
+        return status
     if is_recent_sent_echo(wxid, text):
         logger.info('[%s] 自家回声, 忽略: %.30s', remark, text)
-        return
+        return 'ok'
     # 窗口重连/重绘后 runtime_id 集体变化，历史消息会被误判为新消息重复转发
     # （曾导致一条命令被转发 3 次、提醒反复重设重触发）。60s 内相同
     # (wxid, text) 已转发过则跳过；60s 后正常重发命令不受影响。
     if is_recent_inbound(wxid, text):
         logger.info('[%s] 60s 内已转发过相同内容, 疑似重连误报, 忽略: %.30s',
                     remark, text)
-        return
+        return 'ok'
     logger.info('[%s] 新消息: %.50s', remark, text)
     payload = build_private_message(robot_wxid, wxid, remark, text)
     if post_event(payload):
@@ -401,8 +530,9 @@ def _handle_new_item(robot_wxid: str, wxid: str, remark: str, item) -> None:
             log_inbound(wxid, text)
         except OSError as e:
             logger.warning('[%s] 转发去重记录失败(不影响上报): %s', remark, e)
-    else:
-        logger.error('[%s] 10002 上报失败(已重试): %.50s', remark, text)
+        return 'ok'
+    logger.error('[%s] 10002 上报失败(已重试), 本条下轮重试: %.50s', remark, text)
+    return 'retry'
 
 
 # ============================================================

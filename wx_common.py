@@ -28,7 +28,7 @@ import time
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
 ECHO_FILE = os.path.join(_BASE, 'wx_sent_echo.jsonl')
-_KEEP_LINES = 200      # 截断后保留的行数
+_KEEP_LINES = 5000     # 截断后保留的行数(2026-09-02: 200→5000, 中断对账指纹需覆盖 ~48h)
 _DEFAULT_WINDOW = 60   # 回声判定窗口（秒）：60 秒内发过同样内容视为回声
 
 
@@ -118,6 +118,46 @@ def is_recent_inbound(wxid: str, text: str) -> bool:
                 and rec.get('ts', 0) >= cutoff:
             return True
     return False
+
+
+# ---- 中断对账指纹(2026-09-02) ----
+# listener 中断重开窗口后, 原基线机制把空窗期间到达的消息当哑基线跳过
+# (静默丢失)。补推对账用长窗口指纹定位水位: 从列表尾部往前扫, 第一条
+# 命中「已转发/自家回声」指纹的消息即水位, 其后的未见过消息按序补推。
+# 注意与 is_recent_* 的 60s 判定窗口无关——那两个防的是重连误报/回声,
+# 这里要覆盖整个可能空窗时长(默认 48h)。
+
+def _load_fingerprints(path: str, key: str, ident: str, hours: float) -> set:
+    '''读 jsonl 中 ident 最近 hours 小时内的 content 集合。容忍半行。'''
+    if not os.path.exists(path):
+        return set()
+    cutoff = time.time() - hours * 3600
+    fps = set()
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except OSError:
+        return set()
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except (ValueError, json.JSONDecodeError):
+            continue
+        if rec.get(key) == ident and rec.get('ts', 0) >= cutoff:
+            content = rec.get('content')
+            if content:
+                fps.add(content)
+    return fps
+
+
+def seen_fingerprints(wxid: str, hours: float = 48) -> set:
+    '''该好友 hours 小时内已转发过的消息文本(对账水位)。'''
+    return _load_fingerprints(INBOUND_FILE, 'wxid', wxid, hours)
+
+
+def echo_fingerprints(to_wxid: str, hours: float = 48) -> set:
+    '''hours 小时内本机发给该好友的内容(防自家历史回声被当漏网补推)。'''
+    return _load_fingerprints(ECHO_FILE, 'to', to_wxid, hours)
 
 
 def _maybe_truncate(path: str = ECHO_FILE) -> None:
