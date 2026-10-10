@@ -63,6 +63,7 @@ function Log($m) {
 }
 
 Log "keepalive start pid=$PID"
+$deadSince = 0
 while ($true) {
     try {
         if (-not (Test-Desktop)) {
@@ -75,14 +76,31 @@ while ($true) {
                     Log "session $id disconnected + dead desktop, tscon -> recovered"
                 }
             } elseif ($state -eq 0 -or $state -eq 1) {
-                # Active/Connected: user is attached (maybe minimized or on a
-                # secure desktop). DO NOT tscon - it would kick them off.
-                # Sleep briefly and let the probe settle.
+                # v4 (2026-09-01 晚): RDP 客户端长时间最小化 = 会话 Active 但
+                # 输入桌面死, 键鼠自动化持续失败(当晚 22:40 listener 开窗
+                # 失败实例)。持续 >30s 才接管——UAC 安全桌面等瞬态几秒即过。
+                # 代价: 用户客户端被断开, 回来重连一次; 优于挂机期间
+                # 发送重试耗尽丢消息。用户侧建议: 离开时直接点 x 断开。
+                if ($deadSince -eq 0) {
+                    $deadSince = Get-Date
+                } elseif (((Get-Date) - $deadSince).TotalSeconds -ge 30) {
+                    $r = & tscon $id /dest:console 2>&1
+                    Start-Sleep -Seconds 2
+                    if (Test-Desktop) {
+                        Log "session $id active-but-dead $($deadSince.ToString('HH:mm:ss')) (minimized RDP?), tscon -> recovered"
+                        $deadSince = 0
+                    }
+                }
                 Start-Sleep -Seconds 5
             } else {
                 Log "probe failed, unexpected session state $state (id=$id)"
             }
+        } else {
+            $deadSince = 0
         }
     } catch { Log "error: $_" }
-    Start-Sleep -Seconds 15
+    # 1s 轮询(2026-09-01 15→3→1): 断开→tscon 接管空窗 ≤1s,
+    # 配合 wx_sender RETRY_DELAY=15s, RDP 断开后消息最坏 ~17s 送达。
+    # 探针=SetCursorPos 原坐标写回, 零开销, 高频无妨。
+    Start-Sleep -Seconds 1
 }

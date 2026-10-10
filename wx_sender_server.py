@@ -113,8 +113,10 @@ def ensure_config() -> dict:
 # ---------------- 发送 worker（单线程，UIA 一次只能操作一个微信窗口） ----------------
 class SendWorker(threading.Thread):
     RETRY_MAX = 3     # 任务失败重试次数（防桌面抖动/UIA 偶发冲突时消息永久丢失）
-    RETRY_DELAY = 60  # 重试间隔（秒）。2026-08-31 21:23 事故: 桌面失效期间
-                      # 3 条消息一次性丢弃, 提醒被"先删后发"语义消耗后再无重发
+    RETRY_DELAY = 15  # 重试间隔（秒）。2026-08-31 21:23 事故: 桌面失效期间
+                      # 3 条消息一次性丢弃。2026-09-01: 60→15, 失败主因是
+                      # RDP 断开后的接管空窗(rdp_keepalive 3s 周期接管),
+                      # 15s 后重试时桌面已恢复, 断开→送达最坏 ~20s
 
     def __init__(self, send_queue: queue.Queue):
         super().__init__(daemon=True, name='send-worker')
